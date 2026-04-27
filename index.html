@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Permission Explorer</title>
+  <meta name="description" content="Salesforce permission explorer — interactive analysis of profiles, permission sets, and effective access." />
+
+  <!--
+    GitHub Pages bootstrap for PermissionExplorer.jsx (v2.9).
+
+    The artifact is shipped as a single React JSX file with one ES-module
+    import (`react`) and one default export. This page loads it on the fly:
+
+      1. React 18 is loaded from a CDN as a global window.React.
+      2. Babel standalone is loaded for in-browser JSX -> JS compilation.
+      3. We fetch the .jsx as plain text, strip the lone `import` statement
+         and the `export default` keyword (so the resulting code can run as
+         a classic script), Babel-transform it, and eval the result.
+      4. The newly-defined PermissionExplorer component is mounted into #root.
+
+    There is no build step. Pushing a new PermissionExplorer.jsx + snapshot.json
+    is enough — refresh the GitHub Pages URL and the change is live within
+    seconds (raw.githubusercontent.com edge cache TTL).
+
+    Cost: Babel-standalone is ~3 MB and JSX compile takes 1–2 seconds on the
+    first load, then nothing on warm reload (HTTP cache). Acceptable for a
+    demo; if you outgrow it, swap this page for a Vite build later.
+  -->
+
+  <style>
+    html, body, #root { margin: 0; padding: 0; height: 100%; background: #0f0f12; color: #e6e6ea; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    .pe-boot {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px; font-size: 14px; color: #a0a0aa;
+    }
+    .pe-boot .spinner {
+      width: 28px; height: 28px; border-radius: 50%;
+      border: 3px solid #2a2a32; border-top-color: #7a8cff;
+      animation: pe-spin 0.8s linear infinite;
+    }
+    .pe-boot .err {
+      max-width: 560px; padding: 16px 20px;
+      border: 1px solid #5a2a2a; border-radius: 8px; background: #1f1416;
+      color: #f5b8b8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    @keyframes pe-spin { to { transform: rotate(360deg); } }
+  </style>
+
+  <!-- React 18 globals. Pinned versions; update together. -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel standalone for JSX -> JS compilation. -->
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+</head>
+<body>
+  <div id="root">
+    <div class="pe-boot">
+      <div class="spinner"></div>
+      <div>Loading Permission Explorer…</div>
+    </div>
+  </div>
+
+  <script>
+    (async function boot() {
+      const root = document.getElementById("root");
+      function fail(msg, err) {
+        root.innerHTML = "";
+        const wrap = document.createElement("div");
+        wrap.className = "pe-boot";
+        const h = document.createElement("div");
+        h.style.fontWeight = "600";
+        h.textContent = "Permission Explorer failed to load.";
+        const pre = document.createElement("div");
+        pre.className = "err";
+        pre.textContent = msg + (err ? "\n\n" + (err.stack || err.message || String(err)) : "");
+        wrap.appendChild(h);
+        wrap.appendChild(pre);
+        root.appendChild(wrap);
+        console.error("[PermissionExplorer boot]", msg, err);
+      }
+
+      try {
+        if (!window.React || !window.ReactDOM || !window.Babel) {
+          throw new Error("React or Babel CDN script did not load. Check the Network tab.");
+        }
+
+        // 1. Fetch the JSX source from the same repo.
+        const jsxRes = await fetch("PermissionExplorer.jsx", { cache: "no-cache" });
+        if (!jsxRes.ok) throw new Error("HTTP " + jsxRes.status + " fetching PermissionExplorer.jsx");
+        let jsxSrc = await jsxRes.text();
+
+        // 2. Strip the lone `import React … from "react"` line — React is a global.
+        jsxSrc = jsxSrc.replace(
+          /^\s*import\s+React\s*,?\s*\{([^}]*)\}\s*from\s*["']react["'];?\s*$/m,
+          (_m, named) => "const { " + named.trim() + " } = React;"
+        );
+        // Fallback for the simpler `import React from "react"` form.
+        jsxSrc = jsxSrc.replace(/^\s*import\s+React\s+from\s*["']react["'];?\s*$/m, "");
+
+        // 3. Strip `export default` so the eval'd code defines PermissionExplorer in our scope.
+        jsxSrc = jsxSrc.replace(/^\s*export\s+default\s+function\s+PermissionExplorer\s*\(/m, "function PermissionExplorer(");
+        jsxSrc = jsxSrc.replace(/^\s*export\s+default\s+/m, "var __default__ = ");
+
+        // 4. Babel-transform JSX → JS. Use the production-ish runtime (classic React.createElement).
+        const transformed = window.Babel.transform(jsxSrc, {
+          presets: [["react", { runtime: "classic" }]],
+        }).code;
+
+        // 5. Evaluate. We expose React on the inner scope so the destructured names resolve.
+        // The function body returns the PermissionExplorer component reference.
+        const factory = new Function("React",
+          transformed +
+          "\nreturn (typeof PermissionExplorer !== 'undefined') ? PermissionExplorer : (typeof __default__ !== 'undefined' ? __default__ : null);"
+        );
+        const App = factory(window.React);
+        if (typeof App !== "function") {
+          throw new Error("PermissionExplorer component was not defined after JSX evaluation.");
+        }
+
+        // 6. Mount.
+        const reactRoot = window.ReactDOM.createRoot(root);
+        reactRoot.render(window.React.createElement(App));
+      } catch (err) {
+        fail("Bootstrap error.", err);
+      }
+    })();
+  </script>
+</body>
+</html>
