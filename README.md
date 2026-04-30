@@ -2,50 +2,48 @@
 
 A single-file React artifact for interrogating Salesforce permission data. Admins export CSVs from their org, upload them into the app, and every analysis runs in-memory — no live Salesforce connection, no OAuth, no Connected App.
 
-This repo is the home of the explorer JSX plus the offline **bake pipeline** that seeds a demo snapshot from a reference Salesforce sandbox. The pipeline runs once at build time — the shipped artifact never calls Salesforce.
+This is the v3.0 release. The artifact is now strictly CSV-driven: there is no built-in demo dataset, and the app never makes any network calls at runtime. Data enters the app through CSV upload or `.pebundle` import, and persists across sessions via an IndexedDB cache.
 
 ## Layout
 
 ```
 PermissionExplorer/
 ├── PermissionExplorer.jsx       # The artifact. Single-file, React + JSX.
-├── data/
-│   └── snapshot.json            # Baked demo dataset. Fetched at runtime from GitHub raw.
-├── scripts/
-│   └── bake-snapshot.js         # Reads mcp-seed/raw/*.json → writes data/snapshot.json.
-├── mcp-seed/                    # (gitignored) Raw un-scrubbed SOQL exports.
-│   └── raw/                     # Drop 13 SOQL JSON files here before running bake.
-├── docs/
-│   └── BAKE.md                  # How to refresh the demo snapshot from a new org.
-├── requirements_v2_8.md         # Engineering work ticket / spec.
-└── .gitignore
+├── index.html                   # Browser entry point.
+├── package.json
+├── requirements_v2_5.md         # Historical specs.
+├── requirements_v2_6.md
+├── requirements_v2_7.md
+├── requirements_v2_8.md
+└── README.md
 ```
 
 ## Runtime data flow
 
-At startup the artifact attempts to fetch `data/snapshot.json` from this repo's `main` branch via `raw.githubusercontent.com`. If the fetch succeeds, the snapshot becomes the working dataset. If it fails (offline, rate-limited, repo private), the app shows an empty state with a prompt to upload CSVs manually.
+On startup the artifact attempts to read a previously-cached dataset from IndexedDB. If a cache exists, the app boots into the Explorer tab in well under a second — no network, no re-upload. If no cache exists, the app boots into the Admin tab with all other tabs hidden, and prompts you to either upload the 13 CSV files or import a `.pebundle`.
 
-CSV upload is always available as a manual override from the Admin tab, regardless of whether the snapshot loaded.
+After a successful CSV upload (the per-file uploader debounces and writes once after the batch settles) or a `.pebundle` import, the app silently writes the parsed dataset back to IndexedDB. The next session starts from that cache automatically.
 
-To point the app at a fork or a different branch, edit the `GITHUB_SNAPSHOT_URL` constant near the top of `PermissionExplorer.jsx`.
+If the cache timestamp is older than 14 days, the app surfaces a yellow staleness banner prompting a refresh. Click Reset (in Admin) to clear both the in-memory dataset and the cache; click Clear Cache to clear only the persisted copy while keeping the current view.
 
-## Refreshing the snapshot
+The artifact never calls Salesforce or any other network endpoint.
 
-See `docs/BAKE.md`. The one-line version:
+## Generating fresh data
 
-```
-# From a Claude Cowork session with Salesforce MCP configured:
-node scripts/bake-snapshot.js
-```
+There are two ways to refresh the dataset:
 
-The script reads the 13 SOQL export files under `mcp-seed/raw/`, applies deterministic SHA-256-keyed pseudonymization to every Id / name / email, fixes join gaps (e.g. ensures every user's `UserRoleId` resolves), distributes users across the 10 standard profiles for coverage, and emits `data/snapshot.json`. A safety grep aborts the build if any known real-org token survives.
+1. **Manual CSV upload.** From the Admin tab, click "View SOQL query" on each card to copy the canonical query, run it against your Salesforce org with the export tool of your choice (Workbench, Data Loader, sf CLI), and upload the resulting CSV into the matching slot.
 
-## Safety invariants
+2. **Weekly Cowork scheduled task.** A scheduled Cowork task runs the 13 SOQL queries against the user's authed Salesforce org once a week, packages the results into both the 13 raw CSV files and a single `.pebundle`, and drops them in the user's Cowork project folder. The previous week's outputs are removed when the new ones are written. The user opens the artifact and clicks "Import Bundle" against the latest `.pebundle` to refresh.
 
-- No live Salesforce credentials in the shipped artifact.
-- No real employee names, emails, or 18-char Salesforce Ids in `data/snapshot.json` (enforced by the bake script's grep list).
-- No runtime MCP calls. The explorer is a pure browser app; the snapshot is static JSON fetched over HTTPS.
+The scheduled task is the simplest path. It keeps Salesforce credentials out of the browser entirely — the bundle is built offline by Cowork and the artifact only sees a static file.
 
-## Versioning
+## The 13 Required Export Queries
 
-Current version: **v2.9** (see `PermissionExplorer.jsx` header for changelog). The v2.8 release shipped the data inline; v2.9 moved it to this repo.
+See `requirements_v2_8.md` §5.1 for the canonical SOQL. The Admin tab also displays every query inline with a Copy button. The 13 queries map 1:1 to the 13 expected CSV files.
+
+## Safety
+
+- No live Salesforce credentials in the artifact.
+- No outbound network calls at runtime.
+- The IndexedDB cache lives only in your browser profile. If you use a shared workstation, run in a private/incognito window or click Clear Cache before closing the tab.

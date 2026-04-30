@@ -1,19 +1,25 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-04-v2.9
+  Version: 2026-04-v3.0
   Claude.ai artifact — single file, default export.
 
-  v2.9 adds:
-    - Repo-backed runtime dataset — the embedded fallback is gone. On startup
-      the artifact fetches data/snapshot.json from this repo over
-      raw.githubusercontent.com; CSV upload remains as a manual override.
-      Configure GITHUB_SNAPSHOT_URL below to point at a fork / different
-      branch. See docs/BAKE.md for how to refresh the snapshot.
-    - Bake-time bug fixes from v2.8: all demo users now distributed across
-      10 standard profiles (fixes the "Explorer tab only shows 2 profiles"
-      report); UserRoleId referential integrity enforced (no more dangling
-      role ids on users); aggressive org-label scrub catches underscore-
-      embedded brand tokens that v2.8's \b-based regex missed.
+  v3.0 (breaking) adds:
+    - CSV-only data flow. The runtime no longer fetches a repo-hosted
+      snapshot. On first load there is no dataset; only the Admin tab is
+      reachable. The user populates data by uploading the 13 CSVs (one per
+      Required Export Query in §5.1) or by importing a .pebundle generated
+      by the weekly Cowork scheduled task.
+    - IndexedDB pebundle cache ("save state"). After a successful CSV
+      upload batch or .pebundle import, the parsed dataset is silently
+      written to IndexedDB as a gzipped pebundle blob. Subsequent sessions
+      boot from cache in well under a second — no re-upload required.
+      A "Clear cached data" button in Admin wipes the cache.
+    - Stale warning. If the cache timestamp is older than CACHE_STALE_DAYS
+      (14), boot surfaces a yellow banner prompting a refresh.
+    - Removed: GITHUB_SNAPSHOT_* constants, fetchGithubSnapshot, the boot
+      fetch useEffect, the source==='github' badge branch, the repo
+      snapshot pipeline (data/snapshot.json, scripts/bake-snapshot.js,
+      docs/BAKE.md, mcp-seed/). See README.md for the new flow.
 
   v2.8 adds:
     - UX-53: Dynamic width — top-level page containers drop the 1680-px cap
@@ -300,32 +306,29 @@ const SYSPERM_COLS = [
 ];
 
 /* ============================================================================
- * 4. DATASET SOURCE — v2.9 repo-hosted snapshot
+ * 4. DATASET SOURCE — v3.0 CSV-only + IndexedDB cache
  *
- * The runtime dataset is fetched on startup from this GitHub repo's
- * `data/snapshot.json`. The snapshot is baked offline by
- * `scripts/bake-snapshot.js` from SOQL exports against a reference Salesforce
- * sandbox, then scrubbed (deterministic SHA-256-keyed pseudonymization) and
- * committed. The artifact never calls Salesforce directly; the snapshot is
- * static JSON served over `raw.githubusercontent.com`.
+ * The artifact never calls Salesforce or any network endpoint at runtime.
+ * Data enters the app exclusively through:
  *
- * To point this artifact at a fork or a different branch, change
- * `GITHUB_SNAPSHOT_URL` below.
+ *   1. Per-file CSV upload from the Admin tab (13 slots, one per Required
+ *      Export Query in §5.1).
+ *   2. .pebundle import from the Admin tab. Pebundles are produced offline
+ *      by the weekly Cowork scheduled task that runs the 13 SOQL queries
+ *      against the user's Salesforce org and packages the results.
  *
- * If the fetch fails (offline, rate-limited, repo private, 404) the app
- * renders an empty-dataset state and prompts the user to upload CSVs
- * manually. CSV upload is always available as an override.
+ * After either path completes, the parsed dataset is silently written to
+ * IndexedDB as a gzipped pebundle. Subsequent sessions hydrate from this
+ * cache on boot — no re-upload, no network. If the cache timestamp is
+ * older than CACHE_STALE_DAYS, a yellow banner prompts a refresh.
+ *
+ * IndexedDB is the only persistence. localStorage is intentionally not
+ * used (5 MB cap; some sandboxed iframes block it). If IDB is unavailable
+ * (private browsing, kiosk, quota exceeded), boot proceeds with an empty
+ * dataset — IDB failure is never fatal.
  * ==========================================================================*/
 
-// Configuration — change these to repoint at a fork.
-const GITHUB_SNAPSHOT_OWNER = "manojaggarwal-sketch";
-const GITHUB_SNAPSHOT_REPO = "permission-explorer";
-const GITHUB_SNAPSHOT_BRANCH = "main";
-const GITHUB_SNAPSHOT_PATH = "data/snapshot.json";
-const GITHUB_SNAPSHOT_URL =
-  `https://raw.githubusercontent.com/${GITHUB_SNAPSHOT_OWNER}/${GITHUB_SNAPSHOT_REPO}/${GITHUB_SNAPSHOT_BRANCH}/${GITHUB_SNAPSHOT_PATH}`;
-
-// Empty dataset skeleton used when no snapshot is loaded.
+// Empty dataset skeleton used when no data is loaded.
 const EMPTY_DATASETS = {
   Profile: [], PermissionSet: [], PermissionSetGroup: [], User: [], UserRole: [],
   PermissionSetAssignment: [], PermissionSetGroupComponent: [],
@@ -333,16 +336,140 @@ const EMPTY_DATASETS = {
   SetupEntityAccess: [], CustomPermission: [], SystemPermissions_PermSet: [],
 };
 
-// Fetch the snapshot. Returns { datasets, meta } on success, throws on failure.
-async function fetchGithubSnapshot(url = GITHUB_SNAPSHOT_URL, signal) {
-  const res = await fetch(url, { signal, cache: "no-cache" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} from ${url}`);
-  const body = await res.json();
-  const { _meta, ...datasets } = body;
-  for (const key of Object.keys(EMPTY_DATASETS)) {
-    if (!Array.isArray(datasets[key])) datasets[key] = [];
+// Returns true if a datasets object has at least one row in any slot. Used to
+// gate the non-Admin tabs.
+function datasetsHaveData(d) {
+  if (!d) return false;
+  for (const k of Object.keys(EMPTY_DATASETS)) {
+    if (Array.isArray(d[k]) && d[k].length > 0) return true;
   }
-  return { datasets, meta: _meta || null };
+  return false;
+}
+
+/* ---- IndexedDB cache layer --------------------------------------------------
+ * One database, one object store, one record keyed "current". The stored
+ * value is a gzipped pebundle blob plus metadata. We never throw out of these
+ * helpers — IDB is best-effort, every method resolves to either a value or
+ * null, and the caller falls back to "no cache."
+ * --------------------------------------------------------------------------*/
+const IDB_DB_NAME = "PermissionExplorer";
+const IDB_DB_VERSION = 1;
+const IDB_STORE = "cache";
+const IDB_KEY = "current";
+const CACHE_SCHEMA_VERSION = 1;
+const CACHE_STALE_DAYS = 14;
+
+function idbOpen() {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === "undefined") return resolve(null);
+    let req;
+    try { req = indexedDB.open(IDB_DB_NAME, IDB_DB_VERSION); }
+    catch { return resolve(null); }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+    req.onblocked = () => resolve(null);
+  });
+}
+
+// Read the cached pebundle. Returns { datasets, dismissals, cachedAt } | null.
+async function idbReadCache() {
+  const db = await idbOpen();
+  if (!db) return null;
+  try {
+    const blob = await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+    db.close();
+    if (!blob) return null;
+    // Stored value is { cachedAt, schemaVersion, pebundle: Blob }
+    if (typeof blob !== "object" || !blob.pebundle) return null;
+    if (blob.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
+    const obj = await gunzipJSON(blob.pebundle);
+    if (!obj || obj.format !== "pebundle") return null;
+    const datasets = {};
+    for (const key of Object.keys(EMPTY_DATASETS)) {
+      datasets[key] = (obj.datasets && obj.datasets[key] && obj.datasets[key].rows) || [];
+    }
+    return {
+      datasets,
+      dismissals: Array.isArray(obj.dismissals) ? obj.dismissals : [],
+      cachedAt: blob.cachedAt || obj.createdAt || null,
+    };
+  } catch {
+    try { db.close(); } catch {}
+    return null;
+  }
+}
+
+// Write the current dataset to cache. No-op on failure; never throws.
+async function idbWriteCache({ datasets, dismissals }) {
+  const db = await idbOpen();
+  if (!db) return false;
+  try {
+    const payload = {
+      format: "pebundle",
+      version: 1,
+      createdAt: new Date().toISOString(),
+      sourceOrg: "",
+      appVersion: "2026-04-v3.0",
+      datasets: Object.fromEntries(FILES.map(f => [f.key, {
+        rows: (datasets && datasets[f.key]) || [],
+        schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
+      }])),
+      dismissals: dismissals || [],
+    };
+    const pebundle = await gzipJSON(payload);
+    const record = {
+      cachedAt: payload.createdAt,
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      pebundle,
+    };
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      const req = tx.objectStore(IDB_STORE).put(record, IDB_KEY);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    });
+    db.close();
+    return true;
+  } catch {
+    try { db.close(); } catch {}
+    return false;
+  }
+}
+
+// Clear the cache record.
+async function idbClearCache() {
+  const db = await idbOpen();
+  if (!db) return false;
+  try {
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      const req = tx.objectStore(IDB_STORE).delete(IDB_KEY);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    });
+    db.close();
+    return true;
+  } catch {
+    try { db.close(); } catch {}
+    return false;
+  }
+}
+
+// Days between two ISO timestamps. Returns Infinity if either is unparseable.
+function ageInDays(isoTs) {
+  if (!isoTs) return Infinity;
+  const t = Date.parse(isoTs);
+  if (!Number.isFinite(t)) return Infinity;
+  return (Date.now() - t) / (24 * 3600 * 1000);
 }
 
 /* ============================================================================
@@ -1578,7 +1705,7 @@ function Empty({ text }) {
 /* ============================================================================
  * 10. ADMIN TAB (Section 7.3) — unified per-dataset cards + bundle export/import
  * ==========================================================================*/
-function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploadedAt, onUpload, onReset, onExportBundle, onImportBundle, manifest, onLoadAllComputations, computing, computingProgress, idx, nav }) {
+function AdminTab({ datasets, source, sourceTs, cachedAt, warnings, xrefWarnings, uploadedAt, onUpload, onReset, onClearCache, onExportBundle, onImportBundle, manifest, onLoadAllComputations, computing, computingProgress, idx, nav }) {
   const [copied, setCopied] = useState(null);
   const fileInputs = useRef({});
   const bundleInput = useRef();
@@ -1597,7 +1724,7 @@ function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploaded
       return <Pill tone="green">CSV upload complete — {loadedCount}/{FILES.length}</Pill>;
     }
     if (source === "bundle") return <Pill tone="accent">Bundle imported — {ago(sourceTs)}</Pill>;
-    if (source === "github") return <Pill tone="purple">Snapshot from GitHub{snapshotMeta && snapshotMeta.bakedAt ? ` · baked ${snapshotMeta.bakedAt.substring(0,10)}` : ""}</Pill>;
+    if (source === "cache") return <Pill tone="purple">From cache{cachedAt ? ` · ${Math.max(1, Math.round(ageInDays(cachedAt)))}d old` : ""}</Pill>;
     if (source === "none") return <Pill tone="yellow">No dataset loaded</Pill>;
     return <Pill tone="mute">No dataset loaded</Pill>;
   })();
@@ -1617,6 +1744,10 @@ function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploaded
           </button>
           <button className="pe-btn secondary" onClick={() => bundleInput.current && bundleInput.current.click()}>Import Bundle</button>
           <button className="pe-btn" disabled={!allLoaded} onClick={onExportBundle}>Export Bundle</button>
+          <button className="pe-btn secondary" onClick={onClearCache}
+            title="Clear the IndexedDB cache. Current view stays loaded; next session will boot to an empty Admin tab.">
+            Clear Cache
+          </button>
           <button className="pe-btn secondary" onClick={onReset}>Reset</button>
           <input ref={bundleInput} type="file" accept=".pebundle,application/octet-stream" style={{ display: "none" }}
             onChange={e => { const f = e.target.files && e.target.files[0]; if (f) onImportBundle(f); e.target.value = ""; }} />
@@ -1626,9 +1757,10 @@ function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploaded
             {computingProgress}
           </div>
         )}
-        <div style={{ marginTop: 10, fontSize: 11, color: T.textMuted }}>
-          Datasets are shared by exporting a <code style={{ fontFamily: T.mono }}>.pebundle</code> file and sending it to teammates.
-          There is no automatic cross-user sync — by design, so you control where your org's permission data lives.
+        <div style={{ marginTop: 10, fontSize: 11, color: T.textMuted, lineHeight: 1.55 }}>
+          Data flow (v3.0): upload the 13 CSVs below, or import a <code style={{ fontFamily: T.mono }}>.pebundle</code> generated by your weekly Cowork scheduled task.
+          After either step, the parsed dataset is cached locally in IndexedDB, so the next session boots instantly without re-uploading.
+          The artifact never calls Salesforce or any other network endpoint at runtime — your data stays in your browser.
         </div>
       </div>
 
@@ -1715,7 +1847,7 @@ function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploaded
         const status = (() => {
           if (source === "upload" && uploadedAt && uploadedAt[f.key]) return { tone: "green", text: `CSV uploaded ${ago(uploadedAt[f.key])}` };
           if (source === "bundle" && rows.length) return { tone: "accent", text: `From bundle` };
-          if (source === "github" && rows.length) return { tone: "purple", text: `From snapshot${snapshotMeta && snapshotMeta.bakedAt ? ` · baked ${snapshotMeta.bakedAt.substring(0,10)}` : ""}` };
+          if (source === "cache" && rows.length) return { tone: "purple", text: `From cache${cachedAt ? ` · ${Math.max(1, Math.round(ageInDays(cachedAt)))}d old` : ""}` };
           return { tone: "mute", text: "Not loaded" };
         })();
         return (
@@ -1759,7 +1891,7 @@ function AdminTab({ datasets, source, sourceTs, warnings, xrefWarnings, uploaded
                   <td style={{ fontFamily: T.mono, fontSize: 12 }}>{f.filename}</td>
                   <td>{rows.length.toLocaleString()}</td>
                   <td style={{ color: T.textMuted, fontSize: 12 }}>
-                    {source === "upload" && uploadedAt && uploadedAt[f.key] ? "CSV upload" : source === "bundle" ? "Bundle" : source === "github" ? "Snapshot" : source === "none" ? "Empty" : "Not loaded"}
+                    {source === "upload" && uploadedAt && uploadedAt[f.key] ? "CSV upload" : source === "bundle" ? "Bundle" : source === "cache" ? "Cache" : source === "none" ? "Empty" : "Not loaded"}
                   </td>
                 </tr>
               );
@@ -4939,13 +5071,13 @@ export default function PermissionExplorer() {
   // "Async loading" = JS parse + fallback index build, synchronous but deferred
   // one tick so the spinner can paint.
   const [bootLoading, setBootLoading] = useState(true);
-  const [tab, setTab] = useState("explorer"); // UX-2 — direct to explorer, no splash.
+  const [tab, setTab] = useState("admin"); // v3.0: default to Admin so first-load lands on the upload UI.
 
   // ---- Datasets + source tracking ----
   const [datasets, setDatasets] = useState(null);
-  const [source, setSource] = useState(null); // "upload" | "bundle" | "github" | "none"
-  const [snapshotMeta, setSnapshotMeta] = useState(null);
+  const [source, setSource] = useState(null); // "upload" | "bundle" | "cache" | "none"
   const [sourceTs, setSourceTs] = useState(null);
+  const [cachedAt, setCachedAt] = useState(null); // ISO ts of cached pebundle (when source==="cache")
   const [uploadedAt, setUploadedAt] = useState({});
   const [uploadErrors, setUploadErrors] = useState({}); // fileKey -> error
   const [customWarnings, setCustomWarnings] = useState([]); // upload validation warnings
@@ -4962,29 +5094,47 @@ export default function PermissionExplorer() {
   // ---- Banner auto-dismiss for bundle-import errors ----
   const [banner, setBanner] = useState(null);
 
-  // v2.9: fetch snapshot from GitHub. CSV upload remains the override.
+  // v3.0: hydrate from IndexedDB cache. No network calls. On miss → empty
+  // dataset and the user starts on Admin. On stale-hit → load anyway, banner
+  // prompts a refresh.
   useEffect(() => {
-    const controller = new AbortController();
+    let cancelled = false;
     (async () => {
       try {
-        const { datasets, meta } = await fetchGithubSnapshot(GITHUB_SNAPSHOT_URL, controller.signal);
-        setDatasets(datasets);
-        setSource("github");
-        setSourceTs(Date.now());
-        setSnapshotMeta(meta);
-      } catch (err) {
+        const cached = await idbReadCache();
+        if (cancelled) return;
+        if (cached && datasetsHaveData(cached.datasets)) {
+          setDatasets(cached.datasets);
+          setDismissals(cached.dismissals || []);
+          setSource("cache");
+          setSourceTs(Date.now());
+          setCachedAt(cached.cachedAt);
+          const age = ageInDays(cached.cachedAt);
+          if (age > CACHE_STALE_DAYS) {
+            setBanner({
+              tone: "yellow",
+              text: `Cached dataset is ${Math.round(age)} days old (older than ${CACHE_STALE_DAYS}-day staleness threshold). Re-upload CSVs or import a fresh weekly .pebundle from your Cowork folder to refresh.`,
+            });
+          }
+          // Cache hit — bring the user back to Explorer rather than Admin.
+          setTab("explorer");
+        } else {
+          setDatasets(EMPTY_DATASETS);
+          setSource("none");
+          setSourceTs(Date.now());
+          // No banner — the empty state in the UI is signal enough, and the
+          // user is already on the Admin tab.
+        }
+      } catch {
+        if (cancelled) return;
         setDatasets(EMPTY_DATASETS);
         setSource("none");
         setSourceTs(Date.now());
-        setBanner({
-          tone: "yellow",
-          text: `Snapshot fetch failed (${err.message}). Upload CSVs in the Admin tab to get started, or edit GITHUB_SNAPSHOT_URL to point at a repo you have access to.`,
-        });
       } finally {
-        setBootLoading(false);
+        if (!cancelled) setBootLoading(false);
       }
     })();
-    return () => controller.abort();
+    return () => { cancelled = true; };
   }, []);
 
   // Build indexes
@@ -4999,6 +5149,11 @@ export default function PermissionExplorer() {
   useEffect(() => { datasetEpochRef.current += 1; }, [datasets]);
 
   // ---- CSV upload handler ----
+  // Uses a ref-tracked debounce to coalesce a batch of file uploads (the user
+  // may select all 13 files at once via the multi-file picker, or paste them
+  // in via drag-drop; we don't want to gzip+write to IDB 13 times in a row).
+  // The actual cache write happens 1.5s after the last upload settles.
+  const cacheWriteTimerRef = useRef(null);
   const onUpload = useCallback(async (fileKey, file) => {
     try {
       const text = await file.text();
@@ -5013,21 +5168,30 @@ export default function PermissionExplorer() {
       setUploadErrors(e => { const n = { ...e }; delete n[fileKey]; return n; });
       setCustomWarnings(w => [...w.filter(x => x.file !== meta.filename),
         ...warnings.map(t => ({ level: "yellow", file: meta.filename, text: t }))]);
-      // On first upload, start from embedded dataset as baseline to avoid
-      // wiping unrelated slots. User hits Reset to start clean.
+      // Merge into existing slots so partial uploads don't wipe unrelated data.
+      // User can hit Reset to start clean.
+      let nextDatasets = null;
       setDatasets(d => {
-        const base = (source === "upload" && d) ? { ...d } : { ...(d || {}) };
+        const base = { ...(d || EMPTY_DATASETS) };
         base[fileKey] = rows;
+        nextDatasets = base;
         return base;
       });
       setSource("upload");
       setSourceTs(Date.now());
+      setCachedAt(null); // Newly uploaded — no longer "from cache."
       setUploadedAt(u => ({ ...u, [fileKey]: Date.now() }));
       setBanner({ tone: "green", text: `${meta.filename}: ${rows.length.toLocaleString()} rows loaded.` });
+      // Debounced cache write.
+      if (cacheWriteTimerRef.current) clearTimeout(cacheWriteTimerRef.current);
+      cacheWriteTimerRef.current = setTimeout(() => {
+        cacheWriteTimerRef.current = null;
+        if (nextDatasets) idbWriteCache({ datasets: nextDatasets, dismissals });
+      }, 1500);
     } catch (err) {
       setBanner({ tone: "red", text: `Failed to read ${file.name}: ${err.message}` });
     }
-  }, [source]);
+  }, [dismissals]);
 
   // ---- Bundle export handler ----
   const onExportBundle = useCallback(async () => {
@@ -5037,7 +5201,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-04-v2.6",
+      appVersion: "2026-04-v3.0",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: datasets[f.key] || [],
         schema: (datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -5069,18 +5233,22 @@ export default function PermissionExplorer() {
       }
       const next = {};
       for (const f of FILES) next[f.key] = (obj.datasets && obj.datasets[f.key] && obj.datasets[f.key].rows) || [];
+      const nextDismissals = Array.isArray(obj.dismissals) ? obj.dismissals : [];
       setDatasets(next);
       setSource("bundle");
       setSourceTs(Date.now());
+      setCachedAt(null);
       setUploadedAt({});
-      setDismissals(Array.isArray(obj.dismissals) ? obj.dismissals : []);
+      setDismissals(nextDismissals);
       setBanner({ tone: "green", text: `Bundle imported: ${file.name}.` });
+      // Persist to IDB so the next session starts from this bundle automatically.
+      idbWriteCache({ datasets: next, dismissals: nextDismissals });
     } catch (err) {
       setBanner({ tone: "red", text: `Import failed — file not recognized as a valid bundle. Current data untouched. (${err.message})` });
     }
   }, []);
 
-  // ---- Reset ----
+  // ---- Reset (clears in-memory state AND the IDB cache) ----
   const onReset = useCallback(() => {
     (async () => {
       setUploadedAt({});
@@ -5089,20 +5257,30 @@ export default function PermissionExplorer() {
       setCustomWarnings([]);
       setImpactMatrix(null);
       setDeleteCandidates(null);
-      setBanner({ tone: "accent", text: "Reloading snapshot from GitHub…" });
-      try {
-        const { datasets, meta } = await fetchGithubSnapshot();
-        setDatasets(datasets);
-        setSource("github");
-        setSourceTs(Date.now());
-        setSnapshotMeta(meta);
-        setBanner({ tone: "green", text: "Snapshot reloaded from GitHub." });
-      } catch (err) {
-        setDatasets(EMPTY_DATASETS);
-        setSource("none");
-        setSourceTs(Date.now());
-        setBanner({ tone: "yellow", text: `Snapshot reload failed (${err.message}).` });
-      }
+      setDatasets(EMPTY_DATASETS);
+      setSource("none");
+      setSourceTs(Date.now());
+      setCachedAt(null);
+      const ok = await idbClearCache();
+      setBanner({
+        tone: ok ? "green" : "yellow",
+        text: ok ? "Reset complete — cached data cleared. Upload CSVs or import a .pebundle to start." : "Reset complete (cache could not be cleared — IDB unavailable).",
+      });
+    })();
+  }, []);
+
+  // ---- Clear cache only (keeps in-memory dataset; next session boots empty) ----
+  const onClearCache = useCallback(() => {
+    (async () => {
+      const ok = await idbClearCache();
+      setCachedAt(null);
+      // If we were sourced from cache, demote so the user sees we're working
+      // off a non-persisted in-memory copy.
+      setSource(s => s === "cache" ? "upload" : s);
+      setBanner({
+        tone: ok ? "green" : "yellow",
+        text: ok ? "Cached data cleared. Current view stays loaded; close the tab to lose it." : "Cache could not be cleared — IDB unavailable.",
+      });
     })();
   }, []);
 
@@ -5149,15 +5327,24 @@ export default function PermissionExplorer() {
     return { totalRows, estMB };
   }, [datasets]);
 
-  // ---- Tab counts ----
-  const tabs = [
+  // ---- Tab list ----
+  // v3.0: when no data is loaded, only Admin is reachable. The other tabs
+  // depend on the index and would render empty / nonsensical content.
+  const hasData = datasetsHaveData(datasets);
+  const allTabs = [
     { key: "explorer", label: "Explorer" },
     { key: "impact", label: "Change Impact" },
-    { key: "prescribe", label: "Prescribe Access" }, // UX-47 v2.7
+    { key: "prescribe", label: "Prescribe Access" },
     { key: "redundancy", label: "Overlap & Redundancy" },
     { key: "migration", label: "Migration" },
     { key: "admin", label: "Admin" },
   ];
+  const tabs = hasData ? allTabs : allTabs.filter(t => t.key === "admin");
+
+  // Force-pin to admin if data is gone (or never loaded).
+  useEffect(() => {
+    if (!hasData && tab !== "admin") setTab("admin");
+  }, [hasData, tab]);
 
   // Auto-dismiss banner
   useEffect(() => {
@@ -5184,12 +5371,12 @@ export default function PermissionExplorer() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ width: 24, height: 24, borderRadius: 6, background: `linear-gradient(135deg, ${T.accent}, ${T.purple})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12 }}>P</div>
             <div style={{ fontWeight: 700 }}>Permission Explorer</div>
-            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v2.9 · Salesforce</div>
+            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.0 · Salesforce</div>
           </div>
           <Tabs tabs={tabs} active={tab} onChange={setTab} />
           <div style={{ flex: 1 }} />
           {/* Data-source badge (7.2) */}
-          {source === "github" && <Pill tone="purple">Snapshot from GitHub{snapshotMeta && snapshotMeta.bakedAt ? ` · baked ${snapshotMeta.bakedAt.substring(0,10)}` : ""}</Pill>}
+          {source === "cache" && <Pill tone="purple">From cache{cachedAt ? ` · ${Math.max(1, Math.round(ageInDays(cachedAt)))}d old` : ""}</Pill>}
           {source === "none" && <Pill tone="yellow">No dataset — upload CSVs in Admin tab</Pill>}
           {source === "upload" && <Pill tone="green">Dataset loaded — CSV upload · {ago(sourceTs)}</Pill>}
           {source === "bundle" && <Pill tone="accent">Dataset loaded — bundle · {ago(sourceTs)}</Pill>}
@@ -5204,9 +5391,9 @@ export default function PermissionExplorer() {
         )}
 
         {/* Non-blocking banner if no dataset (7.2) */}
-        {!datasets && !bootLoading && (
+        {!hasData && !bootLoading && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: T.yellowBg, color: T.yellow, fontSize: 12 }}>
-            No dataset loaded — go to the Admin tab to upload CSV files or import a .pebundle.
+            No dataset loaded — upload the 13 CSV files below, or import a <code style={{ fontFamily: T.mono }}>.pebundle</code> from your Cowork folder.
           </div>
         )}
 
@@ -5226,10 +5413,11 @@ export default function PermissionExplorer() {
             {tab === "redundancy" && <RedundancyTab idx={idx} dismissals={dismissals} setDismissals={setDismissals}
               nav={s => { setSelection(s); setTab("explorer"); }} />}
             {tab === "migration" && <MigrationTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }} />}
-            {tab === "admin" && <AdminTab datasets={datasets} source={source} sourceTs={sourceTs}
+            {tab === "admin" && <AdminTab datasets={datasets} source={source} sourceTs={sourceTs} cachedAt={cachedAt}
               warnings={allWarnings} xrefWarnings={idx ? idx.xrefWarnings : []}
               uploadedAt={uploadedAt}
-              onUpload={onUpload} onReset={onReset} onExportBundle={onExportBundle} onImportBundle={onImportBundle}
+              onUpload={onUpload} onReset={onReset} onClearCache={onClearCache}
+              onExportBundle={onExportBundle} onImportBundle={onImportBundle}
               manifest={manifest} idx={idx}
               nav={s => { setSelection(s); setTab("explorer"); }}
               onLoadAllComputations={onLoadAllComputations} computing={computing} computingProgress={computingProgress} />}

@@ -5,11 +5,10 @@ yarn-debug.log*
 .env
 .env.local
 
-# Raw un-scrubbed SOQL exports. NEVER commit — these contain real employee
-# names, emails, and Salesforce Ids. The bake script reads from here and
-# emits scrubbed output into data/snapshot.json, which IS committed.
-mcp-seed/raw/
-mcp-seed/scrubbed/
+# Local pebundle outputs from the weekly Cowork scheduled task. These contain
+# real Salesforce data and must never be committed.
+bundles/
+*.pebundle
 
 # Session scratch (only relevant when working from a Claude Cowork session)
 /sessions/

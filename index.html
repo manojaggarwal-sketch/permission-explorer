@@ -7,7 +7,7 @@
   <meta name="description" content="Salesforce permission explorer — interactive analysis of profiles, permission sets, and effective access." />
 
   <!--
-    GitHub Pages bootstrap for PermissionExplorer.jsx (v2.9).
+    GitHub Pages bootstrap for PermissionExplorer.jsx (v3.0).
 
     The artifact is shipped as a single React JSX file with one ES-module
     import (`react`) and one default export. This page loads it on the fly:
@@ -19,9 +19,12 @@
          a classic script), Babel-transform it, and eval the result.
       4. The newly-defined PermissionExplorer component is mounted into #root.
 
-    There is no build step. Pushing a new PermissionExplorer.jsx + snapshot.json
-    is enough — refresh the GitHub Pages URL and the change is live within
-    seconds (raw.githubusercontent.com edge cache TTL).
+    There is no build step. Pushing a new PermissionExplorer.jsx is enough —
+    refresh the GitHub Pages URL and the change is live within seconds.
+
+    v3.0 change: there is no snapshot.json. The artifact never makes its own
+    network calls; all data flows through CSV upload or .pebundle import,
+    persisted across sessions in IndexedDB.
 
     Cost: Babel-standalone is ~3 MB and JSX compile takes 1–2 seconds on the
     first load, then nothing on warm reload (HTTP cache). Acceptable for a

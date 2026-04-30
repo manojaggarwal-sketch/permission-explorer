@@ -1,12 +1,9 @@
 {
   "name": "permission-explorer",
-  "version": "2.9.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Salesforce permission explorer — single-file React artifact backed by a GitHub-hosted demo snapshot.",
-  "scripts": {
-    "bake": "node scripts/bake-snapshot.js",
-    "verify": "node scripts/bake-snapshot.js --verify"
-  },
+  "description": "Salesforce permission explorer — single-file React artifact. CSV-only data flow with IndexedDB pebundle cache.",
+  "scripts": {},
   "engines": {
     "node": ">=18"
   }
