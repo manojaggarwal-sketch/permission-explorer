@@ -11,10 +11,11 @@ PermissionExplorer/
 ├── PermissionExplorer.jsx       # The artifact. Single-file, React + JSX.
 ├── index.html                   # Browser entry point.
 ├── package.json
+├── requirements_v3_0.md         # Current spec — v3.0 deltas.
+├── requirements_v2_8.md         # Functional baseline carried forward.
 ├── requirements_v2_5.md         # Historical specs.
 ├── requirements_v2_6.md
 ├── requirements_v2_7.md
-├── requirements_v2_8.md
 └── README.md
 ```
 
