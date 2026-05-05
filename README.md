@@ -2,7 +2,7 @@
 
 A single-file React artifact for interrogating Salesforce permission data. Admins export CSVs from their org, upload them into the app, and every analysis runs in-memory — no live Salesforce connection, no OAuth, no Connected App.
 
-This is the v3.0 release. The artifact is now strictly CSV-driven: there is no built-in demo dataset, and the app never makes any network calls at runtime. Data enters the app through CSV upload or `.pebundle` import, and persists across sessions via an IndexedDB cache.
+This is the v3.0.1 patch release. The artifact is strictly CSV-driven: there is no built-in demo dataset, and the app never makes any network calls at runtime. Data enters the app through CSV upload or `.pebundle` import, and persists across sessions via an IndexedDB cache. v3.0.1 fixes BUG-16 (Prescribe Access could not surface permissions the target user didn't already have) and adds `PermissionsTransferAnyEntity` / `Lead` / `Case` to Query 1 + Query 13's SELECT — see `requirements_v3_0.md` §2.72.
 
 ## Layout
 

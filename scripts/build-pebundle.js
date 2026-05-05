@@ -83,6 +83,31 @@ function readJsonl(filepath) {
   return rows;
 }
 
+// Salesforce REST returns relationship fields as nested objects:
+//   { "Id": "...", "Profile": { "attributes": {...}, "Name": "Sales" } }
+// The artifact's CSVs and the pebundle importer expect flattened keys with
+// dot-paths (e.g. "Profile.Name"). Flatten one level deep — none of our
+// queries traverse deeper. Also strip the Salesforce `attributes` metadata
+// blob that ships on every row and every nested record.
+function flattenRow(r) {
+  const out = {};
+  for (const [k, v] of Object.entries(r)) {
+    if (k === "attributes") continue;
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      // Nested relationship object — flatten one level.
+      for (const [k2, v2] of Object.entries(v)) {
+        if (k2 === "attributes") continue;
+        // Defensive: if a nested value is itself an object (rare), stringify
+        // rather than crash. Our 13 queries don't trigger this.
+        out[`${k}.${k2}`] = (v2 !== null && typeof v2 === "object") ? JSON.stringify(v2) : v2;
+      }
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 // Per-dataset deduplication: if the staged rows include an `Id` column (which
 // the cursor pagination will always add), we de-dup on it. Prevents duplicate
 // rows from a re-run that didn't fully clean staging. Datasets without `Id`
@@ -205,6 +230,7 @@ function main() {
     let rows;
     try { rows = readJsonl(sp); }
     catch (err) { die(3, `Failed to parse ${sp}: ${err.message}`); }
+    rows = rows.map(flattenRow);
     rows = dedupe(rows);
     byKey[d.key] = rows;
     counts[d.key] = rows.length;

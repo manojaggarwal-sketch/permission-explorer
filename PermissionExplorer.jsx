@@ -1,7 +1,21 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-04-v3.0
+  Version: 2026-04-v3.0.1
   Claude.ai artifact — single file, default export.
+
+  v3.0.1 (patch) adds:
+    - BUG-16 fix: Prescribe Access system-permission picker now surfaces every
+      known permission column from the parsed data, regardless of whether any
+      PermSet/Profile in the org currently has it true. The prior `if (v)`
+      filter at line ~4057 made grantable-but-not-currently-granted
+      permissions invisible — including Transfer Record / TransferAnyEntity.
+    - DATA-1: Query 1 (Profile) and Query 13 (PermissionSet system perms) SOQL
+      now request `PermissionsTransferAnyEntity, PermissionsTransferAnyLead,
+      PermissionsTransferAnyCase` so the columns are present in re-exported
+      CSVs. The tolerant parser already handles new columns automatically; no
+      additional code needed.
+    - See requirements_v3_0.md §2.72 BUG-16 for the full audit and the
+      decision points that were resolved before this patch.
 
   v3.0 (breaking) adds:
     - CSV-only data flow. The runtime no longer fetches a repo-hosted
@@ -250,7 +264,7 @@ function rowsToCSV(rows, columns) {
  * ==========================================================================*/
 const SOQL = {
   profile:
-    "SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, UserLicense.Name, LastModifiedDate FROM Profile ORDER BY Name",
+    "SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, UserLicense.Name, LastModifiedDate FROM Profile ORDER BY Name",
   // BUG-8 v2.6: must load implicit profile-owned PermissionSets to join Profile->ObjectPermissions.
   // Query is unfiltered; index builder splits implicit (IsOwnedByProfile=true) from regular.
   permissionSet:
@@ -260,7 +274,7 @@ const SOQL = {
   user:
     "SELECT Id, Name, Email, Profile.Name, ProfileId, UserRoleId, LastLoginDate FROM User WHERE UserType = 'Standard' AND IsActive = true ORDER BY Name",
   userRole:
-    "SELECT Id, Name, DeveloperName, ParentRoleId, PortalType FROM UserRole WHERE PortalType = null ORDER BY Name",
+    "SELECT Id, Name, DeveloperName, ParentRoleId, PortalType FROM UserRole WHERE PortalType = 'None' ORDER BY Name",
   psa:
     "SELECT PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard' ORDER BY AssigneeId",
   psgc:
@@ -276,7 +290,7 @@ const SOQL = {
   customPerm:
     "SELECT Id, DeveloperName, MasterLabel FROM CustomPermission ORDER BY MasterLabel",
   sysPerms:
-    "SELECT Id, Name, Label, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsManageCustomPermissions, PermissionsApiEnabled, PermissionsBulkApiHardDelete, PermissionsDataExport, PermissionsViewSetup, PermissionsManageRoles, PermissionsRunReports FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Label",
+    "SELECT Id, Name, Label, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsManageCustomPermissions, PermissionsApiEnabled, PermissionsBulkApiHardDelete, PermissionsDataExport, PermissionsViewSetup, PermissionsManageRoles, PermissionsRunReports, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Label",
 };
 
 // One row per required file (Section 3.3). Mirrors the Admin-tab card list.
@@ -418,7 +432,7 @@ async function idbWriteCache({ datasets, dismissals }) {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-04-v3.0",
+      appVersion: "2026-04-v3.0.1",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: (datasets && datasets[f.key]) || [],
         schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -681,7 +695,7 @@ function buildIndexes(datasets) {
   if (portalRoles.length) warnings.push({ level: "yellow", file: "UserRole.csv",
     tag: "warning",
     reason: `${portalRoles.length} role(s) have a non-empty PortalType, indicating portal roles not intended for internal permission analysis.`,
-    fix: "Re-run Query 5 with the filter WHERE PortalType = null (or IS NULL) in SOQL and re-upload the file.",
+    fix: "Re-run Query 5 with the filter WHERE PortalType = 'None' in SOQL and re-upload the file. Note: internal roles use the literal picklist value 'None', not SQL NULL.",
     text: `${portalRoles.length} portal role(s) filtered out of UserRole.csv at load time (BUG-9 / UX-12).` });
   const roles = rolesRaw.filter(r => !isPortal(r));
   const roleById = new Map(roles.map(r => [r.Id, r]));
@@ -4051,10 +4065,15 @@ function PrescribeAccessTab({ idx, nav }) {
     for (const rows of idx.fieldPermsByParent.values()) for (const r of rows) set.add(r.Field);
     return [...set].sort().map(f => ({ Field: f, SobjectType: f.split(".")[0] || "" }));
   }, [idx]);
+  // BUG-16 v3.0.1: include EVERY known permission column from the data, regardless of
+  // whether any PermSet/Profile currently has it true. The whole point of Prescribe
+  // Access is to grant access the user (and possibly the org) doesn't yet have. The
+  // prior `if (v)` filter restricted the picker to "permissions someone in the org
+  // already has" which made it impossible to prescribe new ones (e.g. Transfer Record).
   const allSysKeys = useMemo(() => {
     const set = new Set();
     for (const sp of idx.sysPermsByParent.values()) {
-      for (const [k, v] of Object.entries(sp.perms || {})) if (v) set.add(k);
+      for (const k of Object.keys(sp.perms || {})) set.add(k);
     }
     return [...set].sort().map(k => ({ Key: k, Label: k.replace(/^Permissions/, "") }));
   }, [idx]);
@@ -5201,7 +5220,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-04-v3.0",
+      appVersion: "2026-04-v3.0.1",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: datasets[f.key] || [],
         schema: (datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -5371,7 +5390,7 @@ export default function PermissionExplorer() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ width: 24, height: 24, borderRadius: 6, background: `linear-gradient(135deg, ${T.accent}, ${T.purple})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12 }}>P</div>
             <div style={{ fontWeight: 700 }}>Permission Explorer</div>
-            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.0 · Salesforce</div>
+            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.0.1 · Salesforce</div>
           </div>
           <Tabs tabs={tabs} active={tab} onChange={setTab} />
           <div style={{ flex: 1 }} />
