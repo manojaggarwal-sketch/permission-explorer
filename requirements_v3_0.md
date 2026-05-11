@@ -1292,9 +1292,9 @@ So Defect A is confined to one site. The audit is part of this entry's evidence.
 
 ---
 
-### 2.73 UX-57 — Filter Actionable Analyses to Customer-Owned PermSets Only — DEFERRED, PLANNED FOR v3.1
+### 2.73 UX-57 — Filter Actionable Analyses to Customer-Owned PermSets Only — IMPLEMENTING in v3.1
 
-> **Status:** Deferred — not implemented in v3.0. Documented here so the design and acceptance criteria are nailed down before v3.1 work begins. No code, SOQL, or scheduled-task changes accompany this entry.
+> **Status:** Implementing in v3.1 (2026-05-06). Decision points resolved: no open DPs — spec fully self-contained. Implementation as written: `NamespacePrefix` added to Query 2 SELECT; `IsManaged` flag derived at index time; "Include managed packages" toggle (default OFF) added to 5 actionable scenarios; "Managed by" column added to PermSet tables.
 
 **Reason for change:** The Overlap & Redundancy, Migration, Delete-PermSet-Entirely, Reconcile-PermSets, and Remove-PermSet-from-User views currently treat all PermSets uniformly. In practice, only the customer's own custom PermSets are actionable — managed-package PermSets (Salesforce CPQ / SBQQ, Cvent, Steelbrick, Zoom, etc.) are owned by the installed package and cannot be deleted, merged, or modified by the customer's admin. Surfacing them as duplicate, subset, or merge candidates produces noise and false-positive workload. Salesforce-standard PermSets (`IsCustom = false`) are similarly unmodifiable — they ship with the platform.
 
@@ -1357,8 +1357,331 @@ The customer-owned actionable set is `NamespacePrefix IS NULL AND IsCustom = tru
 **Out of scope for UX-57:**
 
 - Editing managed-package PermSets — there's no API for that even if the artifact wanted to attempt it.
-- Auto-detecting which managed packages are installed and presenting a "managed packages summary" view. Could be a future enhancement (UX-58?), but not required to deliver UX-57.
+- Auto-detecting which managed packages are installed and presenting a "managed packages summary" view. Could be a future enhancement, but not required to deliver UX-57.
 - Changing the model for `IsOwnedByProfile = true` (implicit profile-owned PermSets) — those are already excluded from analysis candidates by §6.4 and need no further treatment.
+
+### 2.74 BUG-17 — "Load All Computations" Covers Only 2 of 6 Expensive Precomputes — IMPLEMENTED in v3.0.2
+
+> **Status:** Implemented in v3.0.2 patch release. Surfaced when the user clicked "Load All Computations" on the Admin tab and then observed that every other tab still displayed "Computing…" spinners on first visit. Investigation traced this to the button's narrow scope: `onLoadAllComputations` in `PermissionExplorer.jsx` (line ~5308) only invokes `precomputeImpactMatrix()` and `precomputeDeleteCandidates()`. The Overlap & Redundancy tab (`RedundancyTab` line ~4537) still lazily kicks off four separate precomputes on first visit (`precomputePermSetOverlap`, `precomputePermSetOverlapV26`, `precomputeOrphans`, `precomputeDeadFields`), and the Migration tab has its own first-visit similarity-clustering pass. None of those four+ precomputes share state with the parent component, so the button label is misleading.
+
+**Reason for change:** The button is named "Load All Computations" but loads two of six. Users reasonably expect "all" to mean all. The perceived performance of the entire app degrades on first visit because each heavy tab does its own warm-up despite the user having explicitly asked for everything to be precomputed.
+
+**Changes (deferred to v3.0.2 patch — small + contained):**
+
+1. **Lift state to the parent component.** Add `[overlap, setOverlap]`, `[overlapV26, setOverlapV26]`, `[orphans, setOrphans]`, `[dead, setDead]`, and `[migrationClusters, setMigrationClusters]` (or whatever the migration tab's primary precompute output is named) to `PermissionExplorer`'s state alongside the existing `impactMatrix` and `deleteCandidates`.
+2. **Pass through props to the affected tabs.** `RedundancyTab` and `MigrationTab` receive `overlap`, `overlapV26`, `orphans`, `dead`, `migrationClusters`, and their setters as props.
+3. **Make the lazy-on-first-visit `useEffect`s parent-state-aware.** The pattern is identical to `ScenarioA`'s existing logic at line ~3086 — early-return if the parent has already populated the value, only run the precompute if the prop is null.
+4. **Extend `onLoadAllComputations`.** Add Phase 3 (Overlap & Redundancy precomputes — four parallel `setTimeout`s) and Phase 4 (Migration clustering). Update `setComputingProgress` per phase so the Admin tab spinner shows the right step. Total runtime estimate: 2–6 seconds depending on dataset size.
+5. **Preserve the existing dataset-invalidation effect.** Line ~5163 currently zeroes `impactMatrix` and `deleteCandidates` when `datasets` changes. Extend to also zero the four new pieces of state, so a CSV re-upload or `.pebundle` re-import correctly invalidates everything.
+
+**Acceptance Criteria:**
+
+- After clicking Load All Computations and seeing the green completion banner, navigating to Overlap & Redundancy renders the Duplicate / Subset / Orphaned / Dead Fields panels instantly with no "Computing…" spinner on any of them.
+- Navigating to Migration renders the similarity clusters instantly.
+- Re-uploading any CSV or importing a fresh `.pebundle` correctly clears all six pieces of precomputed state and triggers a fresh Load All on next click.
+- The Admin tab's Computing progress text steps through "Phase 1/4 — Impact Matrix", "Phase 2/4 — Delete candidates", "Phase 3/4 — Overlap & Redundancy", "Phase 4/4 — Migration clusters" so the user sees that more work is happening than before.
+
+**Out of scope for BUG-17:**
+
+- Precomputing per-user / per-PermSet selection-driven analyses (Modify Profile diff, Revoke Field cascade, Prescribe Access ranking) — those depend on user input that doesn't exist at button-click time and must remain on-demand.
+
+### 2.75 BUG-18 — Dead Fields Analysis Must Include Profile-Level Grants — IMPLEMENTED in v3.1 (no code change)
+
+> **Status:** Audit completed 2026-05-06 — no code change required. The `precomputeDeadFields` function (JSX line ~1173) was already correct prior to this audit: it iterates `idx.fieldPermsByField` indiscriminately (all FieldPermissions rows), and for every active user it adds both `u.ProfileId` and the implicit profile-owned PermSet ID (via `idx.profileImplicitPsByProfileId`) to the `assignedParents` Set. FieldPermissions rows under implicit profile PermSets therefore correctly match and are NOT flagged dead. The BUG-19 data fix (v3.0.2) — which added the 69 implicit profile-owned PermSets back into Query 2 — was the functional prerequisite: without those rows in the dataset, `profileImplicitPsByProfileId` had no entries and the join broke silently. With BUG-19 data in the bundle, BUG-18 is automatically resolved. Original concern: the function *may* have been filtering to `IsOwnedByProfile = false`; audit confirms it never did.
+
+**Reason for change:** A field is genuinely dead only if no Profile *and* no PermSet grants Read or Edit on it. Limiting the scan to PermSets generates false positives for orgs that rely on profile-level permissions (which is most orgs). The recommendation to "remove" a dead field is harmful when the field is actively granted by a Profile.
+
+**Changes (deferred to v3.1):**
+
+1. **Audit the current implementation.** Find the function in `PermissionExplorer.jsx` and confirm whether it iterates `idx.fieldPermsByParent` indiscriminately (correct) or filters to `IsOwnedByProfile = false` (incorrect — would exclude implicit profile PermSets).
+2. **Include both grant sources.** A field is dead iff:
+   - No `FieldPermissions` row with `PermissionsRead = true` or `PermissionsEdit = true` exists with a `ParentId` resolvable to any PermSet (regular or implicit-profile-owned), AND
+   - No Profile-level field grant exists (some orgs store profile field grants directly on the Profile row's column-blob form rather than as `FieldPermissions` rows; spec audit needed).
+3. **Surface the source of grants on each not-dead field** so admins understand why a field is excluded from the dead-fields list. This becomes a fast feedback loop when triaging.
+4. **Add a fixture test.** A Profile-only-granted field must NOT appear in the dead-fields list.
+
+**Acceptance Criteria:**
+
+- Pick a field known to be granted by a Profile but no PermSet — the field does NOT appear in the Dead Fields finding.
+- The dead-fields-count metric drops by N rows when the bug is fixed; surface the prior false-positive count somewhere visible during the v3.1 release notes so users understand why their Dead Fields list shrank.
+- A regression fixture test exercises the case in the dev test suite.
+
+### 2.76 UX-58 — "Mergable Permission Sets" Two-Column Tab — IMPLEMENTING in v3.1
+
+> **Status:** Implementing in v3.1 (2026-05-06). Decision points resolved: **(a)** Coexist — new tab alongside Overlap & Redundancy, existing Subset block stays. **(b)** Include both true-subset AND near-subset (labeled distinctly). **(c)** Multi-pane per checked subset (one compare pane per item). **(d)** Persist "Mark for consolidation" through `.pebundle` export/import (same mechanism as dismissals). Original status: Documented, not implemented. Surfaced when the user said "subset relationships need some work; maybe this needs to be its own tab called 'Mergable Permission Sets' with two scrollable columns."
+
+**Reason for change:** Subset relationships are currently presented in the Overlap & Redundancy tab as a list of (consumer, consumed) pairs with side-by-side compare buttons (UX-51 v2.7). When triaging consolidation candidates, the workflow is iterative: pick consumer A, consider consumed B, decide, move on. The list-of-pairs presentation forces the admin to mentally maintain context across pairs. A persistent two-column UI — left column is a scrollable list of consumer (superset) PermSets, right column is the consumed (subset) candidates for whichever consumer is currently selected — keeps consolidation context visible across decisions.
+
+**Changes (deferred to v3.1):**
+
+1. **New tab: "Mergable Permission Sets."** Sits alongside Overlap & Redundancy or replaces the Subset block within it (decision pending; both options have merit).
+2. **Left column.** Scrollable list of all PermSets that have at least one identified subset relationship (i.e., all consumers). Each row shows name, label, current user count, count of subsets it consumes. Sortable by user count, by subset count, alphabetically.
+3. **Right column.** When the user clicks a consumer in the left column, the right shows every PermSet that is a subset of it. Each row shows the same metadata plus an explicit "extras count" (Δ between consumer and subset). Multi-select with checkboxes.
+4. **Bottom action bar.** "Show side-by-side" button opens the existing UX-40 three-tab compare for the selected consumer + checked subsets. "Mark for consolidation" tags the selected pairs with a dismissal/review reason that round-trips through `.pebundle` export.
+5. **Keep the v2.7 UX-51 substantive-extras presentation** as a sub-section within the right column (each subset row expandable to show its extras list).
+
+**Decision points (must be resolved before implementation):**
+
+- (a) Does the new tab *replace* the existing Subset Relationships block in Overlap & Redundancy, or *coexist* with it (the existing block stays as a quick reference, the new tab is the deep workflow)?
+- (b) Does the consumer left column include only "true subset" relationships, or also "near-subset" (≤N tokens of difference)? If near-subset, what N?
+- (c) Multi-select on the right column produces a single batched compare, or one compare-pane per checked subset?
+- (d) Does the "Mark for consolidation" tag persist across `.pebundle` export/import (treat it like a dismissal), or is it session-local?
+
+**Acceptance Criteria (contingent on the above):**
+
+- A user with N subset relationships in their dataset sees N entries in the left column on tab open (sorted per Decision a's choice).
+- Clicking a left-column consumer populates the right column within one frame.
+- Side-by-side compare shows the same information as today's UX-40 compare pane, scoped to the selected consumer + checked subsets.
+- "Mark for consolidation" persists per Decision d.
+
+### 2.77 UX-59 — Duplicate PermSets Two-Column Tab — IMPLEMENTING in v3.1
+
+> **Status:** Implementing in v3.1 (2026-05-06). Decision points resolved: same set as UX-58 — **(a)** coexist, **(b)** include near-dups, **(c)** multi-pane compare, **(d)** persist marks through pebundle. Companion to UX-58. The user said "do a similar thing to duplicate permissions."
+
+**Reason for change:** Same UX rationale as UX-58, applied to Duplicate PermSets. Today's UX-40 v2.6 surfaces duplicates as a list with side-by-side compare buttons. A two-column persistent picker speeds iterative triage when a customer has many duplicate clusters.
+
+**Changes (deferred to v3.1):**
+
+1. Add a "Duplicate Permission Sets" tab (or sub-tab within "Mergable Permission Sets" per Decision a in §2.76).
+2. **Left column.** Scrollable list of duplicate clusters (each cluster is 2+ PermSets that grant identical token sets). Each row shows the cluster size and a representative label.
+3. **Right column.** When a cluster is selected, list every PermSet in it with name, label, user count, group memberships. Multi-select.
+4. **Bottom action bar.** "Compare" opens a side-by-side N-way compare for the checked PermSets. "Pick winner" prompts for which PermSet to keep; the others get tagged for consolidation. Reassignment plan (move users from losers to winner) is generated and exported as part of the dismissal/migration record.
+5. **Near-Duplicate bucket.** Extend the existing UX-40 near-duplicate detection (one-token diff) to render in the same tab with an explicit "near-duplicate" badge and the diff token surfaced inline.
+
+**Decision points:** Same set as UX-58 (replace vs coexist, near-duplicate threshold, multi-select compare semantics, persistence).
+
+**Acceptance Criteria:**
+
+- Duplicate clusters appear in the left column with cluster sizes ≥ 2.
+- Picking a winner from a cluster of 3 generates a reassignment plan that moves N users from the 2 losers to the 1 winner with zero loss.
+- The plan exports as a CSV (matching the v2.5 export pattern) and round-trips through bundle export/import.
+
+### 2.78 UX-60 — Last Assignment Activity on Orphaned PermSets (Query 14 / SetupAuditTrail) — IMPLEMENTING in v3.1
+
+> **Status:** Implementing in v3.1 (2026-05-06). No open decision points. Surfaced when the user said "orphaned permission sets might be more useful to know when the last time an active user was assigned to that permission set." Investigation confirmed that Salesforce's `SetupAuditTrail` records assignment lifecycle events under `Action = 'PermSetAssign'` (4,356 rows in the Bullhorn org), `Action = 'PermSetUnassign'` (1,028 rows), and `Action = 'PermSetGroupAssign'` / `'PermSetGroupUnassign'` for group-via assignments. The `Display` field is parseable: `Permission set <Label>: assigned to user <Name> (UserID: [<UserId>])`.
+
+**Reason for change:** Today's Orphaned PermSets finding is a binary "no users assigned right now." That ignores temporal context — a PermSet that lost its last user yesterday is meaningfully different from one that's been orphaned for a year. Auditors and admins both benefit from knowing the recency of orphaning.
+
+**Changes (deferred to v3.1):**
+
+1. **Add Query 14 to §5.1.** New SOQL:
+
+   ```sql
+   SELECT Id, CreatedDate, Action, Display, CreatedById FROM SetupAuditTrail WHERE Action IN ('PermSetAssign','PermSetUnassign','PermSetGroupAssign','PermSetGroupUnassign') ORDER BY CreatedDate DESC
+   ```
+
+   Expected row count in Bullhorn: ~5,400+. Add to the scheduled task prompt as dataset [14] and to the JSX `FILES` array.
+
+2. **Parse the Display field.** Regex: `/^Permission set (?:group )?(.+?): (assigned|unassigned) to user (.+?) \(UserID: \[(\w+)\]\)$/`. Capture: PermSet Label, action verb, User Name, User Id. Build a `Map<PermSetLabel, Array<{ts, action, userId, userName}>>` at index time, then for each Orphaned PermSet, look up by label.
+
+3. **Display "last activity" on each Orphaned row.** Format: `Last unassigned: 47 days ago · Smith, Jane`. Tooltip shows the parsed Display text. If no audit-trail entry exists for that label (older than retention or renamed PermSet), render `No recent assignment activity in audit window`.
+
+4. **Document the Label → Id join limitation.** SetupAuditTrail logs PermSet *Label*, not Id. If a PermSet was renamed, old audit entries reference the prior label and won't match. Acceptable degradation: surface "may be stale" badge when no Id-confident match exists.
+
+5. **6-month retention caveat.** Salesforce SetupAuditTrail retains 6 months by default unless Field Audit Trail is enabled. Surface this in the §3.3 data-loading docs and on the Admin tab's Query 14 card description.
+
+**Acceptance Criteria:**
+
+- Each Orphaned PermSet row in Overlap & Redundancy shows a "Last activity" column with either a parsed timestamp + user, or an explicit "no recent activity" message.
+- Sorting Orphaned PermSets by "last activity" works and surfaces the most-recently-orphaned PermSets first.
+- A renamed PermSet whose old name appears in audit-trail produces a "may be stale label match" warning rather than crashing or matching the wrong row.
+- The 6-month retention is mentioned in the Admin tab's Query 14 card so admins understand why some orphans show "no recent activity."
+
+**Out of scope for UX-60:**
+
+- A full "PermSet activity timeline" view per PermSet (would be useful but is its own feature). UX-60 surfaces a single "last activity" stat; richer timelines are a future UX-NN.
+- Reconstructing the org's prior assignment state at a historical point in time. The audit log is event-based, not snapshot-based; retroactive snapshots are out of scope.
+
+### 2.79 UX-61 — Dormant / Empty / Single-User Profile Analysis — IMPLEMENTING in v3.1
+
+> **Status:** Implementing in v3.1 (2026-05-06). Decision points resolved: **(a)** Slider with no pre-set — threshold field is blank until the user drags; no results shown until a value is chosen. **(b)** Dormant = 100% of assigned users over the threshold (every assigned user must be dormant). **(c)** Single-User Profiles include integration/system users with a visible "(integration)" flag on the row rather than hiding them. Surfaced when the user asked "do we have any dead profiles? or near dead ones?"
+
+**Reason for change:** The artifact has no "Dormant Profiles" analysis today. Profiles with zero active users, all-dormant assigned users, or a single assigned user are consolidation targets in the same way that orphaned PermSets are. Adding this view brings parity to the Profile side of the model.
+
+**Changes (deferred to v3.1):**
+
+1. **New analysis block** in the Migration tab (alongside profile-to-PermSetGroup migration planning, §6.4) called "Dormant Profiles."
+2. **Three categories:**
+   - **Empty Profile**: zero active-standard users assigned (since Query 4 already filters to those, this is the count of `Profile.Id`s with no `User.ProfileId` join).
+   - **Dormant Profile**: every assigned user has `LastLoginDate` older than N days. Default N = 90; configurable via a slider on the analysis card.
+   - **Single-User Profile**: exactly one assigned active user. Fragile — a single-point-of-failure for the access tied to that profile.
+3. **Per-row metadata.** For each dormant profile: profile name, user count, oldest-login date, list of assigned users (truncated with "+N more"), suggested consolidation target (similar profile by Jaccard). For empty profiles: profile name, last-known activity from SetupAuditTrail (depends on UX-60), suggested removal.
+4. **Cross-link to Migration cluster analysis.** A dormant profile's similarity-cluster membership is shown so admins can see candidate replacement profiles.
+
+**Decision points:**
+
+- (a) Default dormancy threshold: 90 days, 180 days, or admin-configurable only?
+- (b) "Dormant" requires *every* assigned user to be dormant, or *at least 50%*? "At least 50% with average dormancy > N days" might be more useful in practice.
+- (c) Does Single-User Profile filter out integration users / system profiles by default, or include them with a flag?
+
+**Acceptance Criteria:**
+
+- Each of the three categories renders with row counts at the top (e.g., "3 empty, 7 dormant, 12 single-user").
+- An empty profile that's a known org structural element (e.g., "Customer Community User" if no community is configured) appears in the list — accepted false positive; admin dismisses with a reason that round-trips through `.pebundle` export.
+- A dormant profile's suggested consolidation target is computed via the same similarity clustering as §6.4.
+- An "Export to CSV" button writes per-category CSVs.
+
+### 2.80 UX-62 — Cross-Link Orphaned PermSets to Delete-PermSet-Entirely Workflow — IMPLEMENTING in v3.1
+
+> **Status:** Implementing in v3.1 (2026-05-06). No open decision points. Surfaced when the user asked "isn't orphaned permission sets and delete permsets entirely the same thing?"
+
+**Reason for change:** The two views are conceptually related but architecturally distinct: Orphaned PermSets is a passive observation (no current users), Delete PermSet Entirely is an active what-if workflow that runs against any PermSet. An orphan is the most obvious deletion candidate, but today the user has to manually copy the orphan's name into the Delete PermSet typeahead in a different tab. A direct cross-link is a small UX improvement with a real time-savings.
+
+**Changes (deferred to v3.1):**
+
+1. **Action button on every Orphaned PermSet row:** "Run Delete Impact Analysis →" launches the Delete PermSet Entirely workflow with the typeahead pre-populated.
+2. **Reverse cross-link** on the Delete PermSet Entirely workflow's PermSet typeahead: when an orphan is selected, render an "(orphaned)" badge so the admin sees the safe-to-delete signal up front.
+3. **Empty-state nudge** on the Delete PermSet Entirely tab: if any orphans exist, surface a "N orphaned PermSets — start here →" link at the top of the typeahead.
+
+**Acceptance Criteria:**
+
+- Clicking "Run Delete Impact Analysis" on an orphan row navigates to Change Impact → Delete PermSet Entirely with the orphan's name pre-loaded in the typeahead and the analysis already running.
+- Selecting an orphan in the Delete PermSet typeahead displays the "(orphaned)" badge.
+- The empty-state nudge only renders when orphans exist; otherwise the typeahead has no banner.
+
+**Out of scope:**
+
+- Actually deleting the PermSet from Salesforce. The artifact remains read-only; the user runs the actual delete in Salesforce Setup using the analysis as their justification.
+
+### 2.81 UX-63 — Simulation Mode (What-If) with Named Pebundle Export — DEFERRED, PLANNED FOR v3.1
+
+> **Status:** Documented, not implemented. Surfaced when the user said "for change impact I want a way to simulate removing the permset from the user… if I remove the permset then it should 'disappear' and propagate throughout the app as if it were in the system but then be able to reset back to baseline. then also have an export pbundle that we can name for each test run."
+
+**Reason for change:** Today's Change Impact scenarios are point-in-time analyses scoped to one (user, action, target) tuple. The user wants a richer model: globally simulate a hypothetical change, see the effective-permissions cascade across the entire app (Explorer detail panels, User detail provenance, PermSet detail assigned-users count, Object/Field "granted by" lists, etc.), then optionally save the simulated state as a named `.pebundle` for stakeholder review. This is a "what-if scenarios" feature familiar from financial planning tools and legacy admin consoles.
+
+**Why this matters:** A real consolidation decision touches 50–500 users across multiple PermSets. Validating before-and-after by running point-in-time queries one at a time misses cascading effects. Simulation mode lets the admin model the full change, capture the result, and share it without ever touching production.
+
+**Changes (deferred to v3.1):**
+
+1. **State model.** At the top of `PermissionExplorer`:
+
+   ```js
+   const [baselineDatasets, setBaselineDatasets] = useState(null);   // the imported / cached truth
+   const [simulatedDatasets, setSimulatedDatasets] = useState(null); // null when not simulating
+   const [simulation, setSimulation] = useState(null);                // { name, type, target, createdAt, mutations }
+   const isSimulating = !!simulatedDatasets;
+   ```
+
+   Every existing reference to `datasets` is replaced with `isSimulating ? simulatedDatasets : baselineDatasets`. The `idx` builds off whichever is active.
+
+2. **Simulation actions.** Each is a button on the relevant detail view that opens a confirm dialog and then mutates `simulatedDatasets`:
+
+   - **Remove PermSet from User**: PermSet detail → "Simulate removing from user…" picker → strips the matching `PermissionSetAssignment` row.
+   - **Remove PermSet from ALL users**: PermSet detail → "Simulate removing from all assignees" → strips every PSA row for that PermSet. Confirmation dialog warns the count.
+   - **Delete PermSet Entirely**: same as above, plus removes the PermSet from any group it's a member of.
+   - **Add PermSet to User**: User detail → "Simulate adding PermSet…" picker → inserts a synthetic PSA row.
+   - **Future**: Modify Profile, Reassign User Profile, Add Field Permissions to PermSet — same pattern.
+
+3. **Cascading propagation.** Because every analysis reads from the active datasets and every index is rebuilt off `idx = useMemo(buildIndexes(activeDatasets))`, a single mutation cascades automatically: User effective permissions update, PermSet assigned-user counts shift, Object/Field "granted by" lists refresh, Impact Matrix re-derives.
+
+4. **Header banner during simulation.** Yellow non-blocking banner at the top of the app: `Simulating: <name> · <N> mutations · Reset to baseline`. The Reset link reverts `simulatedDatasets` to `null` and clears `simulation`.
+
+5. **"Save simulation" → named `.pebundle` export.** Button in the simulation banner. Prompts for a name. Output filename: `permission-explorer_<sluggified-name>_<timestamp>.pebundle`. The bundle's `simulation` metadata block records:
+
+   ```json
+   {
+     "isSimulation": true,
+     "name": "<user-supplied>",
+     "baselineCreatedAt": "<original baseline ISO>",
+     "simulationCreatedAt": "<this export's ISO>",
+     "mutations": [
+       { "type": "removePSA", "permSetId": "...", "userId": "..." }
+     ]
+   }
+   ```
+
+   On import, the artifact recognizes the simulation flag and renders a banner: "Imported simulation: <name> — original baseline was <date>. Reset to switch to current data." Allows reviewers to step through the same simulated state the author shared.
+
+**Decision points:**
+
+- (a) Should the simulation banner block destructive actions on the *real* CSV upload + IDB cache (since they would clobber the baseline that simulation diffs against)?
+- (b) When importing a simulation `.pebundle`, does the artifact require the user's current baseline to match the simulation's recorded baseline, or just load the simulated state regardless? (Strict matching prevents "simulating against a different org" confusion.)
+- (c) Should simulations support undo/redo per mutation, or are mutations atomic (you Reset everything to undo)?
+- (d) Cache simulation state to IndexedDB across browser sessions? (Currently the IDB cache stores baseline. Storing simulations separately would be its own slot keyed by name.)
+- (e) Stacked simulations within a single session — allow chaining mutations, or require Reset between scenarios?
+
+**Acceptance Criteria:**
+
+- Open User detail for Azam Malik. Click "Simulate adding PermSet → SBQQ Admin". The User's effective permissions instantly reflect the addition, header pill shows "Simulating: Add SBQQ to Azam · 1 mutation · Reset to baseline".
+- Navigate to Object detail → Account. The "Granted By" list now includes the simulated grant chain.
+- Navigate to PermSet detail → SBQQ Admin. Assigned-user count is +1 with Azam in the list, flagged "(simulated)".
+- Click "Reset to baseline". All views revert; banner disappears; the original PermSet detail shows the original assignee count.
+- Re-run, click "Save simulation" → name "Azam SBQQ pilot" → file downloads as `permission-explorer_azam-sbqq-pilot_<timestamp>.pebundle`.
+- In a fresh tab, Import that bundle. Header banner reads "Imported simulation: Azam SBQQ pilot — original baseline was <date>." All Object/Field/User views reflect the simulated state.
+- Click Reset on the simulation banner — the baseline (from the imported bundle's `_baseline` slot) is restored.
+
+**Out of scope for UX-63:**
+
+- Live Salesforce write-back. The artifact remains read-only.
+- Multi-user collaboration on a simulation. Simulations export as files; sharing via file is the only collaboration model.
+- Time-series simulations (e.g., "what happens 6 months from now if we apply changes A then B then C"). Simulations are atomic snapshots of an end state.
+- Auto-suggesting the optimal mutations to achieve a goal. The admin specifies the mutations; the artifact only models the consequences.
+
+### 2.82 BUG-19 — Query 2 SOQL Drift: Filter Excludes Implicit Profile-Owned PermSets, Breaking Profile→Object/Field Joins — IMPLEMENTED in v3.0.2
+
+> **Status:** Implemented in v3.0.2 patch release. Surfaced when the user navigated to the Sales profile detail in Explorer and saw "0 Objects Granted" / "0 Fields Granted" with the yellow `Implicit PermissionSet: not found — Objects/Fields may be empty if your org stores profile perms under the implicit PermissionSet (BUG-8). Check that PermissionSet.csv includes IsOwnedByProfile=true rows with ProfileId populated.` diagnostic banner. Cross-checked against the Field detail view for `SBQQ__QuoteLine__c.NEO_Overage_Price__c` which showed "Profile Grants (0)" and "Permission Set Grants (2)". A direct Salesforce query against `FieldPermissions` for the same field returned 42 grant rows (40 implicit profile-owned + 2 explicit/standalone). Same root cause for both observations.
+
+**Reason for change:** Salesforce auto-creates an implicit PermissionSet for every Profile (`IsOwnedByProfile = true`, with `ProfileId` pointing back to the originating Profile). Profile-level Object and Field permissions are stored as `ObjectPermissions` / `FieldPermissions` rows whose `ParentId` references those implicit PermSets, *not* the Profile itself. The artifact's index builder resolves Profile detail views by joining `Profile.Id` → `PermissionSet.ProfileId` (where `IsOwnedByProfile = true`) → `ObjectPermissions.ParentId` / `FieldPermissions.ParentId`.
+
+When `PermissionSet.csv` lacks the implicit rows, that join chain breaks. The user sees zero Objects/Fields on every Profile detail view, and Field detail views show artificially low Profile Grant counts because the implicit PermSets that *would* resolve to Profiles are missing.
+
+The JSX's internal SOQL constant at line 257 has the correct unfiltered form (per BUG-8 v2.6, with `ProfileId` in the SELECT). But the **canonical SOQL in §5.1 Query 2 and in the `weekly-permission-explorer-bundle` Cowork scheduled task prompt** carries a `WHERE IsOwnedByProfile = false` filter and omits `ProfileId` from the SELECT. Documentation drift dating back to v2.6: the JSX got fixed, the spec and scheduled task did not. Every bundle built from those two sources has been missing the implicit profile-owned PermSets ever since.
+
+Empirical confirmation against the Bullhorn production org:
+
+- Total `PermissionSet` rows: **758**.
+- Filtered (`WHERE IsOwnedByProfile = false`): **689** — what the prior bundle had.
+- Implicit profile-owned (`WHERE IsOwnedByProfile = true`): **69** — exactly one per Profile (Bullhorn has 69 Profiles).
+- Each implicit row has `ProfileId` populated and `Type = 'Profile'` and `Name = 'X<ProfileId>'`.
+
+Sample Field-grant audit for `SBQQ__QuoteLine__c.NEO_Overage_Price__c`:
+
+- Direct SOQL against `FieldPermissions`: 42 distinct granting rows.
+- Of those, 40 have `Parent.IsOwnedByProfile = true` (implicit profile-owned) and 2 have `Parent.IsOwnedByProfile = false` (Slack Integration User read-only, Salesforce CPQ User Custom read+edit).
+- Artifact's Field detail view in v3.0.1 shows: 0 Profile Grants + 2 Permission Set Grants. Misses every one of the 40 implicit rows.
+
+**Changes (deferred to v3.0.2 patch):**
+
+1. **Update §5.1 Query 2 SOQL.** Drop `WHERE IsOwnedByProfile = false` and add `ProfileId` to the SELECT. Final form:
+
+   ```sql
+   SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId FROM PermissionSet ORDER BY Id
+   ```
+
+   Add an inline historical note explaining why and pointing to this BUG-19 entry. (NOTE: this §5.1 edit was already applied during investigation; the §2 entry below is the canonical record.)
+
+2. **Update the scheduled task prompt** (`weekly-permission-explorer-bundle`'s SKILL.md). Replace the Query [2] block:
+   - Drop `WHERE IsOwnedByProfile = false` from both the COUNT preflight and the SELECT.
+   - Add `ProfileId` to the SELECT.
+   - Add a `NOTE (v3.0.2 BUG-19): ...` paragraph explaining the implicit-PermSet model, why filtering breaks the join, and the expected count delta (689 → 758 in Bullhorn).
+   - Update the expected-row-counts gut-check at the bottom of the prompt: `PermissionSet 689` → `PermissionSet 758`.
+
+3. **No JSX changes required.** The JSX's internal SOQL at line 257 is already correct. The index builder at lines 568-598 handles the unfiltered data correctly per the BUG-8 v2.6 fix. Only the spec + scheduled task need to catch up.
+
+4. **Re-fetch and rebuild the bundle.** With the fixed scheduled task (or a manual one-off Workbench export of the corrected SOQL), generate a new `permission-explorer_<timestamp>.pebundle` containing the implicit PermSets. The artifact's existing index builder picks them up automatically — no re-deployment of v3.0.1 JSX required for the data side. (The v3.0.2 patch mainly bumps version strings and registers BUG-19 in the changelog block.)
+
+5. **Bump version strings.** JSX header to `2026-04-v3.0.2`, runtime header pill to `v3.0.2 · Salesforce`, `appVersion` field in `onExportBundle` and `idbWriteCache`, `package.json` to `3.0.2`, `index.html` bootstrap comment, README.
+
+**Acceptance Criteria:**
+
+- After re-fetching Query 2 with the corrected SOQL and rebuilding the bundle, importing it into the artifact: the Sales profile detail view shows ≥1 row in each of Objects Granted / Fields Granted / System Perms Granted (Sales has 243 ObjectPermissions rows tied to its implicit PermSet in Bullhorn; expected counts will track that).
+- The yellow `Implicit PermissionSet: not found` diagnostic banner does not render on any Profile detail view in the new bundle.
+- The Field detail view for `SBQQ__QuoteLine__c.NEO_Overage_Price__c` (the user's repro case) shows 40 Profile Grants and 2 Permission Set Grants, totaling 42 — matching the direct SOQL count.
+- A `grep -nE "IsOwnedByProfile = false" requirements_v3_0.md` returns matches only in the v3.0.2 changelog and BUG-19 historical-note sections (i.e., references to the *old* incorrect filter, never the canonical query template).
+- The scheduled task's `weekly-permission-explorer-bundle` SKILL.md, when re-fetched via `mcp__scheduled-tasks__list_scheduled_tasks`, shows the corrected Query [2] form.
+- A regression fixture test loads a synthetic bundle that includes implicit PermSets, picks an arbitrary Profile, and asserts that `objPermsByParent.get(profileFanoutIds[0]).length > 0`. Add this to the dev test suite.
+
+**Decision points (small set, mostly mechanical):**
+
+1. **Should the v3.0.2 patch include the BUG-17 fix from §2.74 (Load All Computations covers only 2 of 6 precomputes), or ship BUG-19 alone first?** Both are scoped as v3.0.2 in the version-history table. Bundling them is reasonable since both are small and both ship before v3.1. Or split: BUG-19 ships as v3.0.2 (data-correctness defect, urgent), BUG-17 ships as v3.0.3 (perf defect, less urgent).
+2. **Migration plan for users on stale bundles**: at boot, can the artifact detect "this bundle has zero `IsOwnedByProfile = true` PermSets" and surface a yellow banner prompting a re-export? Cheap to detect, useful as a self-diagnostic. Probably worth including in v3.0.2.
+3. **Backward compatibility**: a bundle exported from a v3.0.1 task run (filtered Query 2) loaded into a v3.0.2 build — what's the behavior? Same as v3.0.1: the existing yellow `Implicit PermissionSet: not found` diagnostic fires. If Decision 2 lands, the new banner surfaces too. No code change required to handle the legacy bundle.
+
+**Out of scope for BUG-19:**
+
+- Renaming `IsOwnedByProfile = true` rows to look more user-friendly. The implicit PermSets have synthetic names like `X00e3g0000012g62AAA` because Salesforce auto-generates them; the artifact already resolves these back to "Sales" in the Profile detail UI via the `ProfileId` join. No UX change needed.
+- Filtering implicit PermSets out of the PermSet entry-point list in the left sidebar. Currently the index builder splits implicit from regular and the sidebar should already exclude implicit (per BUG-8 v2.6). Verify this is working correctly in v3.0.2 acceptance testing.
+- Changing the v2.6 BUG-8 / v2.8 BUG-15 logic that handles the actual Profile→Object join in the renderer. That logic is correct; it just needs the implicit rows to be in the data to operate on.
 
 ---
 
@@ -1523,11 +1846,13 @@ SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsVie
 
 **Query 2 — Permission Sets** → `PermissionSet.csv`
 
-Excludes profile-owned permission sets. `Type` field is used to identify Muting PermSets downstream — no separate Muting query needed.
+**MUST be unfiltered.** Includes both regular PermSets (`IsOwnedByProfile = false`) and the implicit PermSets that Salesforce auto-creates per Profile (`IsOwnedByProfile = true`). The implicit ones are the join target for Profile→Object/Field permissions per BUG-8 (v2.6) and BUG-19 (v3.0.2). `ProfileId` must be in the SELECT so the index builder can map each implicit PermSet back to its originating Profile. `Type` field is used to identify Muting PermSets downstream — no separate Muting query needed.
 
+```sql
+SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId FROM PermissionSet ORDER BY Id
 ```
-SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Label
-```
+
+**Historical note (BUG-19):** v2.5 through v3.0.1 of this spec carried `WHERE IsOwnedByProfile = false` and omitted `ProfileId`. Bundles built from that SOQL are missing the ~1-implicit-PermSet-per-Profile rows, which causes Profile detail views to render "0 Objects Granted / 0 Fields Granted" with the yellow `Implicit PermissionSet: not found` diagnostic banner. The JSX's internal SOQL constant was corrected in v2.6 (BUG-8) but the spec and scheduled task drifted. v3.0.2 corrects both. Re-fetch this query against your org and rebuild the bundle when you upgrade.
 
 **Query 3 — Permission Set Groups** → `PermissionSetGroup.csv`
 
@@ -2019,6 +2344,8 @@ This screen is the 5.2 Landing Screen from v1.9 of the spec. In v2.0+ it is repl
 | 2026-04-v2.7 | April 2026 | Third pass of live-app feedback on the shipped v2.6 build. Added 4 bug fixes — BUG-11 (Effective Objects "Granted by" column renders 18-digit Ids instead of resolved Profile/PermSet/Group names — fallback chain + kind pill required); BUG-12 (Object → Field cascade specified in UX-6 is not wired end-to-end; add `AppStateContext` cascade state + visible scope pill + selected-row styling); BUG-13 (Impact-Matrix Total sort only toggles descending; make it DESC / ASC / unsorted with directional arrow); BUG-14 (Change User Profile loss calc implausibly small — System Administrator → Sales User shows near-zero losses; add golden-file fixture, debug log, verify Profile-vs-Profile diff baseline and implicit-PermSet fan-out). Added 6 UX enhancements — UX-47 Prescribe Access view answering "what PermSet should I assign?" with least-privilege ranking, combination suggestions (greedy set-cover), and side-effect preview (new first-class capability); UX-48 Effective Fields column layout (drop Object column when cascade active; grouped headers when off; field-name truncate+tooltip; fit 1440 px without horizontal scroll); UX-49 Clear affordance on Delete-PermSet-Entirely search (× button + Escape key); UX-50 rename "Modify Profile" → "Change User Profile" tab-wide (UX-35 Future-profile intra-scenario label remains); UX-51 Subset relationships show substantive extras grouped by category with counts + Open-side-by-side + CSV export + auto-reclassify zero-extras as Duplicate; UX-52 unambiguous two-column paired diff labeling (`Has` / `Missing` / `Shared` / `Differs` + legend; eliminate "only in X" phrasing across UX-22 / UX-37 / UX-40 / UX-51). Added 10 acceptance criteria (BUG-11 through BUG-14, UX-47 through UX-52). Status line updated to 13 BUG + 48 UX totals. |
 | 2026-04-v2.8 | April 2026 | Fourth pass of live-app feedback on the shipped v2.7 build. Added 1 bug fix — BUG-15 (Profile detail still empty for Finance: Accounts CRUD not shown and Profile-level system-perm booleans — Chatter Internal User, Create/Customize Dashboards, Customize Application — not rendered; third re-open of BUG-5/BUG-8; root-cause hypotheses split into (1) implicit-PS discovery failure per-profile, (2) Profile.Permissions* boolean columns must be read directly off the Profile row and merged with `sysPermsByParent`, (3) renderer may be keying off Profile.Id where the index stores under implicit-PS Id; fix adds a debug toggle dumping per-fanout-id counts, a `profileBooleansBySystemPermissionKey` map, legacy `ParentId=Profile.Id` fallback, a Finance fixture regression test, and an explicit Query 1 expansion to return every `Permissions*` boolean). Added 2 UX enhancements — UX-53 fluid dynamic width (removes UX-18's 1680 px cap; viewport-filling tables; resizable sidebar/right-panel splitters that persist; prose line-length protection at extreme widths); UX-54 developer-time Salesforce MCP pipeline to seed the embedded fallback with scrubbed real-org data via `mcp__salesforce__*` tools and a committed `build-fallback` script — keeps §3.2 runtime CSV-only model intact (no runtime MCP calls) while producing a realistic demo dataset that exercises every tab and precompute non-trivially. Added 4 acceptance criteria (BUG-15, UX-53, UX-54; UX-53 ACs span 5 viewport widths). Status line updated to 14 BUG + 50 UX totals + MCP-Seeded Fallback. |
 | 2026-04-v2.9 | April 24 2026 | (Superseded by v3.0.) Replaced the embedded fallback (UX-54) with a repo-hosted `data/snapshot.json` fetched at runtime from `raw.githubusercontent.com`. Added bake-time fixes for v2.8 demo-dataset issues: round-robin user assignment across 10 standard profiles, UserRoleId referential-integrity enforcement, aggressive substring scrub for org-specific labels (`BH `, `_BH`, `Bullhorn`, `PNET`). The snapshot pipeline (`scripts/bake-snapshot.js`, `mcp-seed/raw/`, `docs/BAKE.md`) was added in this release and removed in v3.0. |
-| 2026-05-planned-v3.1 | TBD | **Planned — not implemented.** **UX-57** (§2.73): Filter actionable analyses (Overlap & Redundancy, Migration, Delete-PermSet-Entirely, Reconcile, Remove-PermSet-from-User Impact Matrix) to customer-owned custom PermSets only by default. Adds `NamespacePrefix` to Query 2's SELECT, derives an `IsManaged` flag at index time, and ships a "Include managed-package PermSets" toggle (default OFF) plus a "Managed by" column in every PermSet table. Keeps managed-package PermSets visible in informational scenarios (Prescribe Access, User detail provenance, Group drill-down, Field/Object "Granted By"). |
+| 2026-05-v3.0.2 | May 6 2026 | **Patch release — implemented.** Two items: **BUG-17** (§2.74): Extend `onLoadAllComputations` to cover all six expensive precomputes (Impact Matrix, Delete candidates, Overlap & Redundancy clusters, Subset detection, Orphans, Dead Fields, Migration similarity clusters) instead of only the first two. Lifts state to the parent component so RedundancyTab and MigrationTab read precomputed values from props and skip lazy first-visit `useEffect`s when populated. Adds Phase 3/4 to the Computing progress text. **BUG-19** (§2.82): Query 2 SOQL drift — §5.1 and the Cowork scheduled task prompt have been carrying `WHERE IsOwnedByProfile = false` plus omitting `ProfileId` since v2.5, while the JSX's internal SOQL was corrected in v2.6 BUG-8. Bundles built from the spec/scheduled-task SOQL miss the ~1-implicit-PermSet-per-Profile rows that ObjectPermissions / FieldPermissions hang their `ParentId` on for Profile-level grants. Result: every Profile detail view shows "0 Objects Granted / 0 Fields Granted" and Field detail Profile-Grant counts are artificially low (Bullhorn example: 40 of 42 grants on `SBQQ__QuoteLine__c.NEO_Overage_Price__c` are routed through implicit PermSets and were invisible in v3.0.1). Fix: drop the filter, add `ProfileId` to the SELECT in §5.1 and the scheduled task; re-fetch and rebuild bundle. No JSX index-builder changes required — the v2.6 BUG-8 fix already handles unfiltered data. Small, contained patch. |
+| 2026-05-v3.1 | May 11 2026 | **Feature release — implemented.** Seven items from the v3.1 backlog (UX-63 deferred to a future release): **UX-57** (§2.73): `NamespacePrefix` added to Query 2 SELECT; `IsManaged` / `ManagedBy` / `IsActionable` flags derived in `buildIndexes`; "Include managed packages" toggle (default OFF) added to Orphaned PermSets table, Delete Scenario B, and the two new consolidation tabs. **BUG-18** (§2.75): Confirmed no code change required — `precomputeDeadFields` was already correct after the BUG-19 data fix (implicit profile PermSets now present in Query 2 data). **UX-58** (§2.76): New "Mergable PermSets" tab — two-column layout with near-duplicate pairs (Jaccard ≥ 0.85 < 1.0) and strict subset pairs. Left column: pair list with Jaccard badge; right column: `ConsolidatePairPane` grant diff. "Mark for merge" persists `{ kind: "mergable", a, b, … }` to `consolidationMarks` state and `.pebundle`. **UX-59** (§2.77): New "Duplicate PermSets" tab — exact duplicates (Jaccard = 1.0) clustered via union-find (`clusterExactDups`). Left column: cluster list; right column: cluster detail with pair-picker for 3+ members. "Mark for consolidation" persists `{ kind: "dup", clusterKey, ids, … }` to `consolidationMarks`. **UX-60** (§2.78): New Query 14 (`SetupAuditTrail`) with `Action IN ('PermSetAssign','PermSetUnassign','PermSetGroupAssign','PermSetGroupUnassign')`; `auditTrailByPermSetLabel` index built in `buildIndexes` via `AUDIT_RE` regex; "Last activity" column on Orphaned PermSets table; 6-month retention caveat shown. **UX-61** (§2.79): `DormantProfilesBlock` component added to Migration tab — three sub-tables (Empty, Dormant, Single-User) with threshold slider (no pre-set), 100% dormancy rule, service-user hint flag. **UX-62** (§2.80): "Run Delete Impact Analysis →" button on each orphaned PermSet row; navigates to Change Impact tab with Scenario B pre-loaded. `consolidationMarks` state added to `AppStateProvider` and `PermissionExplorer` parent; round-trips through IDB cache, `.pebundle` export, and import. `appVersion` bumped to `2026-05-v3.1`. JSX header, runtime version pill, `package.json`, and `index.html` all updated to v3.1. |
+| 2026-05-planned-v3.1-UX63 | TBD | **Deferred — planned for future release.** **UX-63** (§2.81) Simulation Mode (what-if) with cascading propagation across the entire app and named `.pebundle` export per test run; baseline-vs-simulated dataset state at the top of `PermissionExplorer`; `simulation` metadata block in exported bundles for round-trip review. Deferred because it requires deep architectural changes to state management across all tabs. |
 | 2026-05-v3.0.1 | May 4 2026 | **Patch release — BUG-16 fix + DATA-1 SOQL expansion.** Resolves the Prescribe Access defect surfaced by the user trying to grant Transfer Record to Azam Malik. Two changes: (1) JSX `PrescribeAccessTab.allSysKeys` memo (line ~4057) drops the `if (v)` filter so the picker now shows every permission column known to the data, regardless of current truth value. (2) SOQL Query 1 (Profile) and Query 13 (PermissionSet system perms) expand SELECT to include `PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase` — verified to exist on both objects in the Bullhorn org. Updated in three places: JSX SOQL constants, requirements §5.1, and the `weekly-permission-explorer-bundle` Cowork scheduled task prompt. The current bundle (`permission-explorer_<latest>.pebundle`) was rebuilt with re-fetched Profile.csv and SystemPermissions_PermSet.csv so the new columns are present. Decision points 1–9 in §2.72 were resolved with smallest-reasonable-change choices: filter dropped to "show all known", three Transfer columns added (no broader 80-column enumeration), API field names retained (no friendly-name mapping), v3.0.1 patch versioning chosen over bundling with v3.1. README/index.html/package.json/JSX header all bumped to v3.0.1. Bundle `appVersion` field is now `2026-04-v3.0.1`. |
 | 2026-04-v3.0 | April 30 2026 | **Breaking architectural change.** Removed v2.9's repo-hosted runtime snapshot fetch entirely (ARCH-1). The artifact no longer makes any outbound network calls at runtime. Added IndexedDB pebundle cache with debounced auto-write after CSV upload or `.pebundle` import (ARCH-2). Added 14-day stale-cache banner (UX-55). Added tab gating so only Admin is reachable when no data is loaded (UX-56). Added the `weekly-permission-explorer-bundle` Cowork scheduled task that runs the 13 SOQL queries against the user's authed Salesforce production org weekly, paginates via uniform `Id > lastId` cursor, and produces 13 CSVs + 1 `.pebundle` in the user's Cowork folder (OPS-1). Added `scripts/build-pebundle.js` — a 265-line Node helper that reads 13 staging JSONL files, flattens nested SObject relationships (`row.Profile.Name` → `"Profile.Name"`), strips Salesforce `attributes` blobs, deduplicates by Id, writes 13 CSVs and one gzipped `.pebundle`, and atomically rotates prior outputs. `.gitignore` cleaned: dropped `mcp-seed/`, added `bundles/` and `*.pebundle` (OPS-2). README, JSX header, index.html bootstrap comment, and package.json all updated to v3.0 (DOC-1). Removed: `data/snapshot.json`, `scripts/bake-snapshot.js`, `scripts/build-fallback.js`, `docs/BAKE.md`, `mcp-seed/`, `GITHUB_SNAPSHOT_*` constants, `fetchGithubSnapshot()`, `snapshotMeta` state, `source === "github"` rendering branches. Added 7 acceptance criteria (ARCH-1, ARCH-2, UX-55, UX-56, OPS-1, OPS-2, DOC-1) and 3 main feature criteria (24, 25, 26). **Bug fix carried into v3.0**: Query 5 (UserRole) corrected from `WHERE PortalType = null` to `WHERE PortalType = 'None'`. The original filter shipped in v2.5–v2.9 returned zero rows in production orgs because Salesforce stores the literal picklist value `'None'` for internal roles, never SQL NULL. With the correct filter, Bullhorn returns 162 internal roles (matching the §3.4 reference count). Updated in JSX SOQL constants, error-message copy, requirements §2.14, §5.1, §6.3, §7.3 admin notice example, UX-12 acceptance criterion, and the Cowork scheduled task prompt. |

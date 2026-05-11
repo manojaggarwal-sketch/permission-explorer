@@ -1,7 +1,52 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-04-v3.0.1
+  Version: 2026-05-v3.1
   Claude.ai artifact — single file, default export.
+
+  v3.1 adds:
+    - UX-57: IsManaged flag derived from NamespacePrefix on every PermSet.
+      "Include managed packages" toggle (default OFF) on all actionable
+      analysis lists (Orphaned PermSets, Delete/Merge/Dup scenarios).
+    - UX-58: New "Mergable PermSets" tab — two-column layout showing near-
+      duplicate pairs (Jaccard ≥ 0.85 < 1.0) and strict subsets. Left
+      column: scrollable pair list with Jaccard score badge. Right column:
+      grant-level compare pane. "Mark for merge" persists to .pebundle via
+      consolidationMarks state.
+    - UX-59: New "Duplicate PermSets" tab — exact duplicates (Jaccard = 1.0)
+      clustered via union-find. Cluster list with pair-picker for 3+ members.
+      "Mark for consolidation" persists to .pebundle.
+    - UX-60: New Query 14 (SetupAuditTrail). Last assignment activity column
+      on the Orphaned PermSets table (most recent PermSetAssign / Unassign /
+      GroupAssign / GroupUnassign). 6-month SF retention caveat displayed.
+    - UX-61: Dormant / Empty / Single-User Profile analysis added to
+      Migration tab. Dormancy threshold slider (no pre-set), 100% dormancy
+      rule, service-user hint flag on single-user profiles.
+    - UX-62: "Run Delete Impact Analysis →" button on each orphaned PermSet
+      row cross-links to the Delete Impact (Change Impact tab, Scenario B).
+    - BUG-18: Dead Fields analysis confirmed correct after BUG-19 data fix —
+      no code change needed; profile-level grants flow via implicit PS join.
+    - consolidationMarks: new pebundle-persisted state; round-trips through
+      IDB cache, export, and import.
+    - See requirements_v3_0.md §2.73 through §2.80 for full specs.
+
+  v3.0.2 (patch) adds:
+    - BUG-17 fix: "Load All Computations" now actually loads all six
+      precomputes (Impact Matrix, Delete candidates, Overlap & Redundancy
+      duplicates, Subset relationships, Orphans, Dead Fields, Migration
+      similarity clusters). State lifted to PermissionExplorer parent and
+      passed via props; RedundancyTab and MigrationTab skip their lazy
+      first-visit useEffects when the parent has populated values.
+    - BUG-19 fix: §5.1 Query 2 SOQL drift corrected. The canonical query
+      now drops `WHERE IsOwnedByProfile = false` and includes `ProfileId`,
+      matching the JSX's internal SOQL constant (which was already correct
+      per BUG-8 v2.6). Bundles built from the spec or Cowork scheduled task
+      were missing the implicit profile-owned PermSets that ObjectPermissions
+      / FieldPermissions hang their ParentId on for Profile-level grants.
+      Result of the fix: every Profile detail view now resolves Objects /
+      Fields / System Perms through the implicit-PS join. Field detail's
+      "Profile Grants" count is no longer artificially zero.
+    - See requirements_v3_0.md §2.74 BUG-17 and §2.82 BUG-19 for the full
+      audit trails and decision-point resolutions.
 
   v3.0.1 (patch) adds:
     - BUG-16 fix: Prescribe Access system-permission picker now surfaces every
@@ -267,8 +312,13 @@ const SOQL = {
     "SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, UserLicense.Name, LastModifiedDate FROM Profile ORDER BY Name",
   // BUG-8 v2.6: must load implicit profile-owned PermissionSets to join Profile->ObjectPermissions.
   // Query is unfiltered; index builder splits implicit (IsOwnedByProfile=true) from regular.
+  // UX-57 v3.1: NamespacePrefix added so IsManaged flag can be derived at index time.
   permissionSet:
-    "SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId FROM PermissionSet ORDER BY Label",
+    "SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId, NamespacePrefix FROM PermissionSet ORDER BY Label",
+  // UX-60 v3.1: Query 14 — SetupAuditTrail assignment events for last-activity on orphaned PermSets.
+  // Salesforce retains 6 months by default unless Field Audit Trail is enabled.
+  auditTrail:
+    "SELECT Id, CreatedDate, Action, Display, CreatedById FROM SetupAuditTrail WHERE Action IN ('PermSetAssign','PermSetUnassign','PermSetGroupAssign','PermSetGroupUnassign') ORDER BY CreatedDate DESC",
   permissionSetGroup:
     "SELECT Id, DeveloperName, MasterLabel, Description FROM PermissionSetGroup ORDER BY MasterLabel",
   user:
@@ -308,6 +358,9 @@ const FILES = [
   { key: "SetupEntityAccess",           n: 11, label: "Setup Entity Access (Apex/VF/Custom/App)", filename: "SetupEntityAccess.csv",     soql: SOQL.setup,              required: ["SetupEntityId","SetupEntityType","ParentId"], idField: null },
   { key: "CustomPermission",            n: 12, label: "Custom Permissions",                filename: "CustomPermission.csv",             soql: SOQL.customPerm,         required: ["Id","DeveloperName"],                  idField: "Id" },
   { key: "SystemPermissions_PermSet",   n: 13, label: "System Permissions on PermSets",    filename: "SystemPermissions_PermSet.csv",    soql: SOQL.sysPerms,           required: ["Id","Label"],                          idField: "Id" },
+  // UX-60 v3.1: Query 14 — SetupAuditTrail assignment events. Optional; older bundles omit this
+  // key and orphan rows will show "No recent activity in audit window" without crashing.
+  { key: "SetupAuditTrail",            n: 14, label: "Setup Audit Trail (PermSet assignments)", filename: "SetupAuditTrail.csv",          soql: SOQL.auditTrail,         required: ["Id","Action"],                         idField: "Id" },
 ];
 const FILE_BY_KEY = Object.fromEntries(FILES.map(f => [f.key, f]));
 
@@ -348,6 +401,7 @@ const EMPTY_DATASETS = {
   PermissionSetAssignment: [], PermissionSetGroupComponent: [],
   ObjectPermissions: [], FieldPermissions: [], PermissionSetTabSetting: [],
   SetupEntityAccess: [], CustomPermission: [], SystemPermissions_PermSet: [],
+  SetupAuditTrail: [], // UX-60 v3.1 — optional; missing in older bundles
 };
 
 // Returns true if a datasets object has at least one row in any slot. Used to
@@ -414,6 +468,7 @@ async function idbReadCache() {
     return {
       datasets,
       dismissals: Array.isArray(obj.dismissals) ? obj.dismissals : [],
+      consolidationMarks: Array.isArray(obj.consolidationMarks) ? obj.consolidationMarks : [],
       cachedAt: blob.cachedAt || obj.createdAt || null,
     };
   } catch {
@@ -423,7 +478,7 @@ async function idbReadCache() {
 }
 
 // Write the current dataset to cache. No-op on failure; never throws.
-async function idbWriteCache({ datasets, dismissals }) {
+async function idbWriteCache({ datasets, dismissals, consolidationMarks }) {
   const db = await idbOpen();
   if (!db) return false;
   try {
@@ -432,12 +487,13 @@ async function idbWriteCache({ datasets, dismissals }) {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-04-v3.0.1",
+      appVersion: "2026-05-v3.1",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: (datasets && datasets[f.key]) || [],
         schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
       }])),
       dismissals: dismissals || [],
+      consolidationMarks: consolidationMarks || [],
     };
     const pebundle = await gzipJSON(payload);
     const record = {
@@ -736,6 +792,36 @@ function buildIndexes(datasets) {
     xrefWarnings.push({ level: "yellow",
       text: `${missingGroupMembers} PermissionSetGroupComponent row(s) reference unknown group or permset.` });
 
+  // --- UX-57 v3.1: Derive IsManaged flag on every PermSet -----------------
+  // IsManaged = has a non-empty NamespacePrefix (managed-package owned).
+  // IsStandard = IsCustom===false (Salesforce-platform standard, no namespace).
+  // IsActionable = not managed AND IsCustom===true AND not profile-owned.
+  // Older bundles without NamespacePrefix treat every PermSet as non-managed
+  // (NamespacePrefix will be undefined/empty → IsManaged=false). That is the
+  // conservative degradation — shows more candidates, not fewer.
+  for (const ps of permSetById.values()) {
+    const ns = (ps.NamespacePrefix || "").trim();
+    ps.IsManaged   = ns.length > 0;
+    ps.IsStandard  = !toBool(ps.IsCustom) && !toBool(ps.IsOwnedByProfile);
+    ps.ManagedBy   = ps.IsManaged ? ns : (ps.IsStandard ? "Standard" : null);
+    ps.IsActionable = !ps.IsManaged && !ps.IsStandard && !toBool(ps.IsOwnedByProfile);
+  }
+
+  // --- UX-60 v3.1: SetupAuditTrail → auditTrailByPermSetLabel --------------
+  // Parse Display field. Regex from spec §2.78:
+  //   "Permission set [group] <Label>: [assigned|unassigned] to user <Name> (UserID: [<UserId>])"
+  const AUDIT_RE = /^Permission set (?:group )?(.+?): (assigned|unassigned) to user (.+?) \(UserID: \[(\w+)\]\)$/;
+  const auditTrailByPermSetLabel = new Map(); // label -> [{ts, action, userId, userName}]
+  for (const r of datasets.SetupAuditTrail || []) {
+    const m = r.Display && r.Display.match(AUDIT_RE);
+    if (!m) continue;
+    const [, label, action, userName, userId] = m;
+    const entry = { ts: r.CreatedDate || "", action, userId, userName };
+    if (!auditTrailByPermSetLabel.has(label)) auditTrailByPermSetLabel.set(label, []);
+    auditTrailByPermSetLabel.get(label).push(entry);
+  }
+  // Each label's array is already DESC by CreatedDate (query ORDER BY CreatedDate DESC).
+
   return {
     warnings, xrefWarnings,
     objPermsByParent, fieldPermsByParent, sysPermsByParent, tabsByParent, setupByParent,
@@ -745,6 +831,7 @@ function buildIndexes(datasets) {
     roles, allSysCols,
     profileImplicitPsByProfileId,               // BUG-8 v2.6
     profileBooleansBySystemPermissionKey,       // BUG-15 v2.8
+    auditTrailByPermSetLabel,                   // UX-60 v3.1
   };
 }
 
@@ -3281,18 +3368,36 @@ function ScenarioA({ idx, nav, impactMatrix, setImpactMatrix }) {
 // B: Delete PermSet entirely — typeahead + zero-impact callout + all covering sources.
 // v2.6 UX-32/33/34: impacted users surfaced above the fold, rows split into "Impacted"
 // vs "Impacted but fully covered", tokens rendered with concrete nouns via tokenToNoun.
+// UX-62 v3.1: "(orphaned)" badge in typeahead; empty-state nudge when orphans exist.
+// UX-57 v3.1: "Include managed packages" toggle (default OFF).
 function ScenarioB({ idx, nav, deleteCandidates, setDeleteCandidates }) {
   // UX-21: persist the selected PS across tab switches.
   const { deleteSelectedPs, setDeleteSelectedPs } = useAppState();
   const ps = deleteSelectedPs;
   const setPs = setDeleteSelectedPs;
+  const [includeManagedDelete, setIncludeManagedDelete] = useState(false); // UX-57
 
   useEffect(() => {
     if (deleteCandidates) return;
     setTimeout(() => setDeleteCandidates(precomputeDeleteCandidates(idx)), 30);
   }, [deleteCandidates, idx, setDeleteCandidates]);
 
-  const permsets = useMemo(() => [...idx.permSetById.values()].filter(p => !toBool(p.IsOwnedByProfile)), [idx]);
+  // UX-57: filter out managed/standard PermSets by default.
+  const permsets = useMemo(() => [...idx.permSetById.values()].filter(p =>
+    !toBool(p.IsOwnedByProfile) && (includeManagedDelete || p.IsActionable)
+  ), [idx, includeManagedDelete]);
+
+  // UX-62: build orphan set for badge + nudge.
+  const orphanIds = useMemo(() => {
+    const inGroup = new Set();
+    for (const rows of idx.groupMembers.values()) for (const r of rows) inGroup.add(r.PermissionSetId);
+    const s = new Set();
+    for (const p of idx.permSetById.values()) {
+      if (toBool(p.IsOwnedByProfile)) continue;
+      if ((idx.psaByPermSet.get(p.Id) || []).length === 0 && !inGroup.has(p.Id)) s.add(p.Id);
+    }
+    return s;
+  }, [idx]);
   const analysis = ps && deleteCandidates ? deleteCandidates.get(ps.Id) : null;
 
   const zeroImpactRows = useMemo(() => {
@@ -3333,7 +3438,24 @@ function ScenarioB({ idx, nav, deleteCandidates, setDeleteCandidates }) {
           still available from another source). Tokens are shown as concrete nouns (hover to see the raw
           token) so admins can spot sensitive grants at a glance.
         </div>
-        <Typeahead items={permsets} value={ps} onSelect={setPs} getId={p => p.Id} getLabel={getPsLabel} getSub={getPsSub} placeholder="Type a Permission Set name…" />
+        {/* UX-62 v3.1: nudge when orphans exist */}
+        {!ps && orphanIds.size > 0 && (
+          <div style={{ marginBottom: 8, fontSize: 12, background: T.yellowBg, color: T.yellow, borderRadius: 6, padding: "6px 10px" }}>
+            {orphanIds.size} orphaned PermSet{orphanIds.size !== 1 ? "s" : ""} have no users assigned — these are the safest deletion candidates. Start typing their names or use the <b>Orphaned PermSets</b> list in Overlap &amp; Redundancy to jump here directly.
+          </div>
+        )}
+        <Typeahead items={permsets} value={ps} onSelect={setPs} getId={p => p.Id} getLabel={getPsLabel}
+          getSub={p => [orphanIds.has(p.Id) ? "(orphaned)" : null, getPsSub(p)].filter(Boolean).join(" · ")}
+          placeholder="Type a Permission Set name…" />
+        {/* UX-57 v3.1: managed toggle */}
+        <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, fontSize: 12, color: T.textMuted, cursor: "pointer" }}>
+          <input type="checkbox" checked={includeManagedDelete} onChange={e => setIncludeManagedDelete(e.target.checked)} />
+          Include managed-package &amp; standard PermSets
+        </label>
+        {/* UX-62: badge on currently-selected PS */}
+        {ps && orphanIds.has(ps.Id) && (
+          <div style={{ marginTop: 6, fontSize: 12 }}><Pill tone="yellow">Orphaned — no users currently assigned</Pill></div>
+        )}
         {!deleteCandidates && <div style={{ fontSize: 12, color: T.textMuted, marginTop: 8 }}><span className="pe-spinner" /> Precomputing zero-impact candidates…</div>}
       </div>
 
@@ -4523,22 +4645,45 @@ function PairedDiffPane({ aLabel, bLabel, tokens }) {
  * 13. REDUNDANCY TAB (Section 6.3) — duplicates, subsets, orphans, dead fields
  *    + dismissals (stored in bundle)
  * ==========================================================================*/
-function RedundancyTab({ idx, dismissals, setDismissals, nav }) {
-  const [overlap, setOverlap] = useState(null);
-  const [overlapV26, setOverlapV26] = useState(null); // UX-40 includes near-duplicate bucket
-  const [orphans, setOrphans] = useState(null);
-  const [dead, setDead] = useState(null);
+function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
+                         overlap: overlapProp, setOverlap: setOverlapProp,
+                         overlapV26: overlapV26Prop, setOverlapV26: setOverlapV26Prop,
+                         orphans: orphansProp, setOrphans: setOrphansProp,
+                         dead: deadProp, setDead: setDeadProp }) {
+  // BUG-17 v3.0.2: precompute state is lifted to PermissionExplorer parent so
+  // "Load All Computations" actually populates these. If the parent has them,
+  // we render directly from props and skip the lazy first-visit useEffect.
+  // Local fallback state preserved for backward compat (older callers without
+  // the props still work).
+  const [overlapLocal, setOverlapLocal] = useState(null);
+  const [overlapV26Local, setOverlapV26Local] = useState(null);
+  const [orphansLocal, setOrphansLocal] = useState(null);
+  const [deadLocal, setDeadLocal] = useState(null);
+  const overlap = overlapProp !== undefined ? overlapProp : overlapLocal;
+  const overlapV26 = overlapV26Prop !== undefined ? overlapV26Prop : overlapV26Local;
+  const orphans = orphansProp !== undefined ? orphansProp : orphansLocal;
+  const dead = deadProp !== undefined ? deadProp : deadLocal;
+  const setOverlap = setOverlapProp || setOverlapLocal;
+  const setOverlapV26 = setOverlapV26Prop || setOverlapV26Local;
+  const setOrphans = setOrphansProp || setOrphansLocal;
+  const setDead = setDeadProp || setDeadLocal;
   // UX-21 + UX-40: Compare pane state (pair currently being inspected side-by-side).
   // UX-51 v2.7: subsetExpanded map drives the per-row extras expansion.
+  // UX-57 v3.1: managed toggle. UX-62 v3.1: navigate to Delete scenario.
   const { compareOverlapPair, setCompareOverlapPair,
           reconcileSelection, setReconcileSelection,
-          subsetExpanded, setSubsetExpanded } = useAppState();
+          subsetExpanded, setSubsetExpanded,
+          setDeleteSelectedPs, setImpactScenario } = useAppState();
+  const [includeManagedRedundancy, setIncludeManagedRedundancy] = useState(false); // UX-57
 
   useEffect(() => {
-    setTimeout(() => setOverlap(precomputePermSetOverlap(idx)), 20);
-    setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 25);
-    setTimeout(() => setOrphans(precomputeOrphans(idx)), 30);
-    setTimeout(() => setDead(precomputeDeadFields(idx)), 40);
+    // Only kick off lazy computes for slots that aren't already populated
+    // (BUG-17 v3.0.2 — Load All Computations may have already filled them).
+    if (overlap == null) setTimeout(() => setOverlap(precomputePermSetOverlap(idx)), 20);
+    if (overlapV26 == null) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 25);
+    if (orphans == null) setTimeout(() => setOrphans(precomputeOrphans(idx)), 30);
+    if (dead == null) setTimeout(() => setDead(precomputeDeadFields(idx)), 40);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx]);
 
   const isDismissed = key => !!dismissals.find(d => d.key === key);
@@ -4573,10 +4718,21 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav }) {
           aLabel: s.subsetLabel, bLabel: s.supersetLabel,
           reclassified: true,
         }));
+        // UX-57 v3.1: filter managed/standard PermSets from actionable analysis lists.
+        const managedFilter = r => {
+          if (includeManagedRedundancy) return true;
+          const psA = idx.permSetById.get(r.a || r.subsetId || r.supersetId);
+          const psB = idx.permSetById.get(r.b || r.subsetId || r.supersetId);
+          return (psA ? psA.IsActionable : true) && (psB ? psB.IsActionable : true);
+        };
+        const dupManagedFilter = r => {
+          const psA = idx.permSetById.get(r.a); const psB = idx.permSetById.get(r.b);
+          return includeManagedRedundancy || ((psA ? psA.IsActionable : true) && (psB ? psB.IsActionable : true));
+        };
         const allDups = [...(overlap.dups || []), ...reclassifiedAsDup];
         return (
         <>
-          <SubSectionTable title="Duplicate PermSets" rows={allDups.filter(d => !isDismissed(`dup|${d.a}|${d.b}`))} columns={[
+          <SubSectionTable title="Duplicate PermSets" rows={allDups.filter(d => !isDismissed(`dup|${d.a}|${d.b}`) && dupManagedFilter(d))} columns={[
             { key: "aLabel", label: "PermSet A", render: r => (
               <span>
                 <span onClick={() => nav({ kind: "PermissionSet", item: idx.permSetById.get(r.a) })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.aLabel}</span>
@@ -4605,7 +4761,7 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav }) {
                 columns={["subset", "superset", "category", "token", "label"]}
                 filename="subset_extras.csv" />} />
             {reallySubsets.length === 0 && <Empty text="No subset relationships detected." />}
-            {reallySubsets.filter(d => !isDismissed(`sub|${d.subsetId}|${d.supersetId}`)).map(row => {
+            {reallySubsets.filter(d => !isDismissed(`sub|${d.subsetId}|${d.supersetId}`) && (includeManagedRedundancy || ((idx.permSetById.get(d.subsetId) || {}).IsActionable && (idx.permSetById.get(d.supersetId) || {}).IsActionable))).map(row => {
               const rowKey = `${row.subsetId}|${row.supersetId}`;
               const expanded = !!(subsetExpanded && subsetExpanded[rowKey]);
               const toggle = () => setSubsetExpanded({ ...(subsetExpanded || {}), [rowKey]: !expanded });
@@ -4848,13 +5004,54 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav }) {
           })()}
 
 
-          <SubSectionTable title="Orphaned PermSets" rows={(orphans || []).filter(p => !isDismissed(`orphan|${p.Id}`))} columns={[
-            { key: "Label", label: "PermSet", render: r => <span onClick={() => nav({ kind: "PermissionSet", item: r })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Label}</span> },
+          {/* UX-57 v3.1: managed toggle for orphan list */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
+            <label style={{ fontSize: 12, color: T.textMuted, display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
+              <input type="checkbox" checked={includeManagedRedundancy} onChange={e => setIncludeManagedRedundancy(e.target.checked)} />
+              Include managed-package &amp; standard PermSets
+            </label>
+          </div>
+          <SubSectionTable title="Orphaned PermSets" rows={(orphans || []).filter(p =>
+            !isDismissed(`orphan|${p.Id}`) && (includeManagedRedundancy || p.IsActionable)
+          )} columns={[
+            { key: "Label", label: "PermSet", render: r => (
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span onClick={() => nav({ kind: "PermissionSet", item: r })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Label}</span>
+                {r.ManagedBy && <Pill tone="mute" style={{ fontSize: 10 }}>{r.ManagedBy}</Pill>}
+              </span>
+            ) },
             { key: "Name", label: "Dev name", render: r => <span style={{ fontFamily: T.mono, color: T.textMuted }}>{r.Name}</span> },
-            { key: "actions", label: "", render: r => <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => {
-              const reason = prompt("Dismissal reason (optional):") || "";
-              dismiss(`orphan|${r.Id}`, "orphan", reason);
-            }}>Dismiss</button> },
+            // UX-60 v3.1: last assignment activity from SetupAuditTrail
+            { key: "lastActivity", label: "Last activity", render: r => {
+              const entries = idx.auditTrailByPermSetLabel ? idx.auditTrailByPermSetLabel.get(r.Label) : null;
+              if (!entries || entries.length === 0) return <span style={{ fontSize: 11, color: T.textMuted }}>No recent activity in audit window</span>;
+              const last = entries[0]; // already sorted DESC
+              const ts = last.ts ? new Date(last.ts) : null;
+              const ago = ts ? (() => {
+                const d = Math.floor((Date.now() - ts.getTime()) / 86400000);
+                return d < 1 ? "today" : d === 1 ? "1 day ago" : `${d} days ago`;
+              })() : "unknown date";
+              return (
+                <span style={{ fontSize: 11 }} title={last.ts}>
+                  Last {last.action}: <b>{ago}</b>
+                  {last.userName ? <span style={{ color: T.textMuted }}> · {last.userName}</span> : null}
+                </span>
+              );
+            }},
+            // UX-62 v3.1: cross-link to Delete workflow
+            { key: "actions", label: "", render: r => (
+              <span style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => {
+                  setDeleteSelectedPs(r);
+                  setImpactScenario("B");
+                  if (onNavToDelete) onNavToDelete();
+                }}>Run Delete Impact →</button>
+                <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => {
+                  const reason = prompt("Dismissal reason (optional):") || "";
+                  dismiss(`orphan|${r.Id}`, "orphan", reason);
+                }}>Dismiss</button>
+              </span>
+            ) },
           ]} getRowId={r => r.Id} emptyText="No orphaned PermSets (every PermSet is either assigned or a group member)." />
 
           <SubSectionTable title="Dead Fields" rows={(dead || []).filter(d => !isDismissed(`dead|${d.field}`))} columns={[
@@ -4887,10 +5084,16 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav }) {
 /* ============================================================================
  * 14. MIGRATION TAB (Section 6.4) — Jaccard clustering + three-way decomposition
  * ==========================================================================*/
-function MigrationTab({ idx, nav }) {
-  const [data, setData] = useState(null);
+function MigrationTab({ idx, nav, migrationData: migrationDataProp, setMigrationData: setMigrationDataProp }) {
+  // BUG-17 v3.0.2: precompute state lifted to parent. Skip lazy compute if populated.
+  const [dataLocal, setDataLocal] = useState(null);
+  const data = migrationDataProp !== undefined ? migrationDataProp : dataLocal;
+  const setData = setMigrationDataProp || setDataLocal;
   const [focus, setFocus] = useState(null);
-  useEffect(() => { setTimeout(() => setData(precomputeProfileSimilarity(idx)), 20); }, [idx]);
+  useEffect(() => {
+    if (data == null) setTimeout(() => setData(precomputeProfileSimilarity(idx)), 20);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx]);
   if (!data) return <div style={{ padding: 40, textAlign: "center" }}><span className="pe-spinner" /> Clustering profiles…</div>;
 
   return (
@@ -4955,6 +5158,576 @@ function MigrationTab({ idx, nav }) {
         })}
         {data.clusters.length === 0 && <Empty text="No high-similarity clusters (using Jaccard ≥ 0.70)." />}
       </div>
+
+      {/* UX-61 v3.1: Dormant / Empty / Single-User Profile Analysis */}
+      <DormantProfilesBlock idx={idx} nav={nav} />
+    </div>
+  );
+}
+
+// UX-61 v3.1: Dormant / Empty / Single-User Profile Analysis
+// Decisions: (a) slider no pre-set — show nothing until user drags
+//            (b) Dormant = 100% of assigned users over threshold
+//            (c) Single-User: include integration/service users with a flag
+function DormantProfilesBlock({ idx, nav }) {
+  const [threshold, setThreshold] = useState(null); // days; null = not set
+  const [sliderVal, setSliderVal] = useState(90);   // display value while dragging
+
+  // Build usersByProfile from idx.userById.
+  const usersByProfile = useMemo(() => {
+    const m = new Map();
+    for (const u of idx.userById.values()) {
+      if (!u.ProfileId) continue;
+      if (!m.has(u.ProfileId)) m.set(u.ProfileId, []);
+      m.get(u.ProfileId).push(u);
+    }
+    return m;
+  }, [idx]);
+
+  const { emptyProfiles, dormantProfiles, singleUserProfiles } = useMemo(() => {
+    const empty = [], dormant = [], single = [];
+    const nowMs = Date.now();
+
+    for (const profile of idx.profileById.values()) {
+      const users = usersByProfile.get(profile.Id) || [];
+      const activeCount = users.length;
+
+      // Empty: zero active standard users.
+      if (activeCount === 0) {
+        empty.push({ profile, users: [] });
+        continue;
+      }
+
+      // Single-User: exactly one user.
+      if (activeCount === 1) {
+        const u = users[0];
+        const nameL = (u.Name || "").toLowerCase();
+        const emailL = (u.Email || "").toLowerCase();
+        const serviceHint = ["service","integration","system","api","batch","sync","auto"].some(k =>
+          nameL.includes(k) || emailL.includes(k)
+        );
+        single.push({ profile, users, serviceHint });
+        // A single-user profile can also be dormant — don't continue here.
+      }
+
+      // Dormant: threshold must be set; ALL assigned users must be over it.
+      if (threshold !== null && activeCount > 0) {
+        const thresholdMs = threshold * 86400000;
+        const allDormant = users.every(u => {
+          if (!u.LastLoginDate) return true; // never logged in → treat as dormant
+          return (nowMs - new Date(u.LastLoginDate).getTime()) > thresholdMs;
+        });
+        if (allDormant) dormant.push({ profile, users, oldestLogin: users.reduce((m, u) =>
+          (!u.LastLoginDate || (m && new Date(m) > new Date(u.LastLoginDate))) ? u.LastLoginDate : m, null
+        ) });
+      }
+    }
+    return { emptyProfiles: empty, dormantProfiles: dormant, singleUserProfiles: single };
+  }, [idx, usersByProfile, threshold]);
+
+  const isServiceHint = u => {
+    const n = (u.Name || "").toLowerCase(); const e = (u.Email || "").toLowerCase();
+    return ["service","integration","system","api","batch","sync","auto"].some(k => n.includes(k) || e.includes(k));
+  };
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <HeaderBlock title="Dormant Profiles" subtitle="Empty, dormant, and single-user profiles are consolidation candidates." />
+      <div style={{ background: T.bgAlt, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 14, fontSize: 12, color: T.textMuted, lineHeight: 1.5 }}>
+        <div style={{ marginBottom: 4 }}><b style={{ color: T.text }}>Empty Profile</b> — zero active standard users assigned. Safe removal candidate once confirmed no batch jobs reference the profile.</div>
+        <div style={{ marginBottom: 4 }}><b style={{ color: T.text }}>Dormant Profile</b> — every assigned user's last login is older than the chosen threshold. Set the slider below to enable this category.</div>
+        <div><b style={{ color: T.text }}>Single-User Profile</b> — exactly one user assigned. A single-point-of-failure; consider migrating that user to a shared base profile. Service/integration-flagged users are included with a note.</div>
+      </div>
+
+      {/* Dormancy threshold slider */}
+      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>Dormancy threshold:</span>
+          <input type="range" min={14} max={730} step={7} value={sliderVal}
+            onChange={e => setSliderVal(Number(e.target.value))}
+            onMouseUp={() => setThreshold(sliderVal)}
+            onTouchEnd={() => setThreshold(sliderVal)}
+            style={{ flex: 1, minWidth: 120, maxWidth: 300 }} />
+          <span style={{ fontSize: 13, fontWeight: 600, color: T.accent, minWidth: 80 }}>
+            {threshold === null ? <span style={{ color: T.textMuted }}>(drag to set)</span> : `${sliderVal} days`}
+          </span>
+          {threshold !== null && <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => { setThreshold(null); setSliderVal(90); }}>Clear</button>}
+        </div>
+        {threshold !== null && <div style={{ fontSize: 11, color: T.textMuted, marginTop: 6 }}>Showing profiles where every assigned user has not logged in for more than {threshold} days.</div>}
+      </div>
+
+      {/* Summary pills */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        <Pill tone="red">{emptyProfiles.length} empty</Pill>
+        {threshold !== null ? <Pill tone="yellow">{dormantProfiles.length} dormant (&gt;{threshold}d)</Pill> : <Pill tone="mute">dormant — set threshold</Pill>}
+        <Pill tone="purple">{singleUserProfiles.length} single-user</Pill>
+      </div>
+
+      {/* Empty Profiles table */}
+      <SubSectionTable title={`Empty Profiles (${emptyProfiles.length})`} rows={emptyProfiles} columns={[
+        { key: "name", label: "Profile", render: r => <span onClick={() => nav({ kind: "Profile", item: r.profile })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.profile.Name}</span> },
+        { key: "type", label: "Type", render: r => <span style={{ fontSize: 11, color: T.textMuted }}>{r.profile.UserType || "—"}</span> },
+      ]} getRowId={r => r.profile.Id} emptyText="No empty profiles." />
+
+      {/* Dormant Profiles table */}
+      {threshold !== null && (
+        <SubSectionTable title={`Dormant Profiles — all users inactive &gt;${threshold} days (${dormantProfiles.length})`} rows={dormantProfiles} columns={[
+          { key: "name", label: "Profile", render: r => <span onClick={() => nav({ kind: "Profile", item: r.profile })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.profile.Name}</span> },
+          { key: "users", label: "Users", render: r => <span style={{ fontSize: 11 }}>{r.users.map(u => u.Name).slice(0, 3).join(", ")}{r.users.length > 3 ? ` +${r.users.length-3} more` : ""}</span> },
+          { key: "lastLogin", label: "Most recent login", render: r => {
+            const ts = r.users.reduce((m, u) => {
+              if (!u.LastLoginDate) return m;
+              return (!m || new Date(u.LastLoginDate) > new Date(m)) ? u.LastLoginDate : m;
+            }, null);
+            if (!ts) return <span style={{ color: T.textMuted, fontSize: 11 }}>Never logged in</span>;
+            const d = Math.floor((Date.now() - new Date(ts).getTime()) / 86400000);
+            return <span style={{ fontSize: 11 }}>{d} days ago</span>;
+          }},
+        ]} getRowId={r => r.profile.Id} emptyText={`No dormant profiles at ${threshold}-day threshold.`} />
+      )}
+
+      {/* Single-User Profiles table */}
+      <SubSectionTable title={`Single-User Profiles (${singleUserProfiles.length})`} rows={singleUserProfiles} columns={[
+        { key: "name", label: "Profile", render: r => <span onClick={() => nav({ kind: "Profile", item: r.profile })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.profile.Name}</span> },
+        { key: "user", label: "User", render: r => (
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span onClick={() => nav({ kind: "User", item: r.users[0] })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.users[0].Name}</span>
+            {r.serviceHint && <Pill tone="mute" style={{ fontSize: 10 }}>service?</Pill>}
+          </span>
+        )},
+        { key: "lastLogin", label: "Last login", render: r => {
+          const ts = r.users[0] && r.users[0].LastLoginDate;
+          if (!ts) return <span style={{ color: T.textMuted, fontSize: 11 }}>Never</span>;
+          const d = Math.floor((Date.now() - new Date(ts).getTime()) / 86400000);
+          return <span style={{ fontSize: 11 }}>{d} days ago</span>;
+        }},
+      ]} getRowId={r => r.profile.Id} emptyText="No single-user profiles." />
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 14c. UX-58 MERGABLE PERMSETS TAB + UX-59 DUPLICATE PERMSETS TAB  (v3.1)
+ *      §2.76 + §2.77  — two-column consolidation workflow tabs
+ * ==========================================================================*/
+
+// Union-find helper — group exact-duplicate PermSets into clusters.
+// Input: dups array from precomputePermSetOverlapV26 (pairs {a,b}).
+// Output: array of arrays, each containing all Ids that share the same sig.
+function clusterExactDups(dups) {
+  const parent = {};
+  const find = id => {
+    if (!parent[id]) parent[id] = id;
+    if (parent[id] !== id) parent[id] = find(parent[id]);
+    return parent[id];
+  };
+  const union = (a, b) => { parent[find(b)] = find(a); };
+  for (const d of dups) union(d.a, d.b);
+  const clusters = {};
+  for (const d of dups) {
+    const root = find(d.a);
+    if (!clusters[root]) clusters[root] = new Set();
+    clusters[root].add(d.a);
+    clusters[root].add(d.b);
+  }
+  return Object.values(clusters).map(s => [...s]);
+}
+
+// Shared detail pane — side-by-side grant diff for any two PermSets.
+// Used by both MergablePermSetsTab and DuplicatePermSetsTab.
+function ConsolidatePairPane({ idx, aId, bId }) {
+  const aPs = idx.permSetById.get(aId);
+  const bPs = idx.permSetById.get(bId);
+  if (!aPs || !bPs) return null;
+  const sigA = grantorSignature(idx, aPs.Id);
+  const sigB = grantorSignature(idx, bPs.Id);
+  const all = [...new Set([...sigA, ...sigB])].sort();
+  const tokens = all.map(t => ({ token: t, label: tokenToNoun(t), inA: sigA.has(t), inB: sigB.has(t) }));
+  const shared = tokens.filter(r => r.inA && r.inB).length;
+  const aOnly  = tokens.filter(r => r.inA && !r.inB).length;
+  const bOnly  = tokens.filter(r => !r.inA && r.inB).length;
+  const uni = sigA.size + sigB.size - shared;
+  const jaccard = uni === 0 ? 0 : shared / uni;
+  const aLabel = aPs.Label || aPs.Name;
+  const bLabel = bPs.Label || bPs.Name;
+  const usersA = new Set((idx.psaByPermSet.get(aPs.Id) || []).map(x => x.UserId));
+  const usersB = new Set((idx.psaByPermSet.get(bPs.Id) || []).map(x => x.UserId));
+  return (
+    <div>
+      {/* Summary pills */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        <Pill tone="accent">Jaccard {(jaccard * 100).toFixed(1)}%</Pill>
+        <Pill tone="mute">{shared} shared</Pill>
+        {aOnly > 0 && <Pill tone="orange">{aOnly} only in A</Pill>}
+        {bOnly > 0 && <Pill tone="orange">{bOnly} only in B</Pill>}
+      </div>
+      {/* Stats cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+        {[{ ps: aPs, sig: sigA, users: usersA, label: aLabel }, { ps: bPs, sig: sigB, users: usersB, label: bLabel }].map(({ ps, sig, users, label }) => (
+          <div key={ps.Id} style={{ background: T.bgAlt, borderRadius: 8, padding: 10, fontSize: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
+            <div style={{ color: T.textMuted }}>{sig.size} grants · {users.size} users</div>
+            {ps.IsManaged && <Pill tone="mute" style={{ marginTop: 4, fontSize: 10 }}>Managed ({ps.ManagedBy})</Pill>}
+          </div>
+        ))}
+      </div>
+      {/* Token diff */}
+      <PairedDiffLegend style={{ marginBottom: 6 }} />
+      <div style={{ maxHeight: 420, overflowY: "auto" }}>
+        <PairedDiffPane aLabel={aLabel} bLabel={bLabel} tokens={tokens} />
+      </div>
+    </div>
+  );
+}
+
+// §2.76 UX-58 — Mergable PermSets tab.
+// Shows near-duplicate pairs (Jaccard ≥ 0.85 < 1.0) and subset pairs.
+// Left column = scrollable list of pairs. Right column = compare pane for the selected pair.
+// "Mark for merge" persists a consolidationMark to the pebundle.
+function MergablePermSetsTab({ idx, overlapV26, setOverlapV26, consolidationMarks, setConsolidationMarks, nav }) {
+  // Lazy-trigger overlap computation if this tab is visited before RedundancyTab.
+  useEffect(() => {
+    if (overlapV26 == null && idx) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 10);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx]);
+  const [includeManaged, setIncludeManaged] = useState(false);
+  const [selected, setSelected] = useState(null); // { kind, a, b, aLabel, bLabel, score }
+
+  const isMarked = useCallback((a, b) =>
+    consolidationMarks.some(m =>
+      m.kind === "mergable" && ((m.a === a && m.b === b) || (m.a === b && m.b === a))
+    ), [consolidationMarks]);
+
+  const toggleMark = useCallback((a, b, aLabel, bLabel) => {
+    if (isMarked(a, b)) {
+      setConsolidationMarks(prev => prev.filter(m =>
+        !(m.kind === "mergable" && ((m.a === a && m.b === b) || (m.a === b && m.b === a)))
+      ));
+    } else {
+      setConsolidationMarks(prev => [...prev, { kind: "mergable", a, b, aLabel, bLabel, markedAt: new Date().toISOString() }]);
+    }
+  }, [isMarked, setConsolidationMarks]);
+
+  const nearDups = useMemo(() => {
+    if (!overlapV26) return [];
+    return overlapV26.nearDups.filter(d => {
+      if (includeManaged) return true;
+      const a = idx.permSetById.get(d.a), b = idx.permSetById.get(d.b);
+      return (a && a.IsActionable) || (b && b.IsActionable);
+    });
+  }, [overlapV26, idx, includeManaged]);
+
+  const subsets = useMemo(() => {
+    if (!overlapV26) return [];
+    return overlapV26.subsets.filter(d => {
+      if (includeManaged) return true;
+      const sub = idx.permSetById.get(d.subsetId), sup = idx.permSetById.get(d.supersetId);
+      return (sub && sub.IsActionable) || (sup && sup.IsActionable);
+    });
+  }, [overlapV26, idx, includeManaged]);
+
+  const total = nearDups.length + subsets.length;
+  const markedCount = consolidationMarks.filter(m => m.kind === "mergable").length;
+
+  const ListRow = ({ row, kind }) => {
+    const a = kind === "subset" ? row.subsetId   : row.a;
+    const b = kind === "subset" ? row.supersetId : row.b;
+    const aLabel = kind === "subset" ? row.subsetLabel   : row.aLabel;
+    const bLabel = kind === "subset" ? row.supersetLabel : row.bLabel;
+    const isSel  = selected && selected.a === a && selected.b === b;
+    const marked = isMarked(a, b);
+    const aPs = idx.permSetById.get(a);
+    const bPs = idx.permSetById.get(b);
+    const managedOf = [aPs?.IsManaged && aPs.ManagedBy, bPs?.IsManaged && bPs.ManagedBy].filter(Boolean);
+    return (
+      <div
+        className="pe-row"
+        onClick={() => setSelected({ kind, a, b, aLabel, bLabel, score: row.score })}
+        style={{
+          padding: "10px 12px", cursor: "pointer", borderRadius: 8, marginBottom: 2,
+          background: isSel ? T.cardHover : "transparent",
+          borderLeft: isSel ? `3px solid ${T.accent}` : "3px solid transparent",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
+          {kind === "near"
+            ? <Pill tone={row.score >= 0.95 ? "red" : row.score >= 0.90 ? "orange" : "yellow"}>{(row.score * 100).toFixed(0)}%</Pill>
+            : <Pill tone="cyan">subset</Pill>}
+          {marked && <Pill tone="green">✓</Pill>}
+        </div>
+        <div style={{ fontSize: 13, fontWeight: 500 }}>{aLabel}</div>
+        <div style={{ fontSize: 11, color: T.textMuted }}>
+          {kind === "subset" ? "⊆ " : "≈ "}{bLabel}
+        </div>
+        {managedOf.length > 0 && (
+          <div style={{ fontSize: 10, color: T.textDim, marginTop: 2 }}>managed: {managedOf.join(", ")}</div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ padding: 24 }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+        <div style={{ fontWeight: 700, fontSize: 18 }}>Mergable PermSets</div>
+        <Pill tone="accent">{total}</Pill>
+        {markedCount > 0 && <Pill tone="green">{markedCount} marked</Pill>}
+        <div style={{ flex: 1 }} />
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer", color: T.textMuted }}>
+          <input type="checkbox" checked={includeManaged} onChange={e => setIncludeManaged(e.target.checked)} />
+          Include managed packages
+        </label>
+      </div>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20 }}>
+        PermSets with ≥ 85% grant overlap or where one is a strict subset of another.
+        Mark pairs you plan to consolidate — marks persist to your .pebundle.
+      </div>
+
+      {!overlapV26 ? (
+        <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>
+          <span className="pe-spinner" style={{ marginRight: 10 }} />Calculating overlap…
+        </div>
+      ) : total === 0 ? (
+        <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>No mergable PermSet pairs detected.</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 20, alignItems: "start" }}>
+          {/* Left — pair list */}
+          <div style={{ background: T.card, borderRadius: 12, padding: 10, maxHeight: 680, overflowY: "auto" }}>
+            {nearDups.length > 0 && (
+              <>
+                <div style={{ fontSize: 10, fontWeight: 700, color: T.textDim, letterSpacing: ".08em", textTransform: "uppercase", padding: "4px 8px 8px", borderBottom: `1px solid ${T.border}`, marginBottom: 6 }}>
+                  Near-duplicates — {nearDups.length}
+                </div>
+                {nearDups.map(d => <ListRow key={`near|${d.a}|${d.b}`} row={d} kind="near" />)}
+              </>
+            )}
+            {subsets.length > 0 && (
+              <>
+                <div style={{ fontSize: 10, fontWeight: 700, color: T.textDim, letterSpacing: ".08em", textTransform: "uppercase", padding: `${nearDups.length > 0 ? "14" : "4"}px 8px 8px`, borderBottom: `1px solid ${T.border}`, marginBottom: 6 }}>
+                  Subsets — {subsets.length}
+                </div>
+                {subsets.map(d => <ListRow key={`sub|${d.subsetId}|${d.supersetId}`} row={d} kind="subset" />)}
+              </>
+            )}
+          </div>
+
+          {/* Right — compare pane */}
+          <div style={{ background: T.card, borderRadius: 12, padding: 20 }}>
+            {selected ? (
+              <>
+                {/* Action bar */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                  <button
+                    className="pe-btn"
+                    style={{ fontSize: 12, background: isMarked(selected.a, selected.b) ? T.green : T.accent }}
+                    onClick={() => toggleMark(selected.a, selected.b, selected.aLabel, selected.bLabel)}
+                  >
+                    {isMarked(selected.a, selected.b) ? "✓ Marked for merge" : "Mark for merge"}
+                  </button>
+                  <button className="pe-btn ghost" style={{ fontSize: 12 }}
+                    onClick={() => nav({ kind: "PermissionSet", item: idx.permSetById.get(selected.a) })}>
+                    Open {selected.aLabel} →
+                  </button>
+                  <button className="pe-btn ghost" style={{ fontSize: 12 }}
+                    onClick={() => nav({ kind: "PermissionSet", item: idx.permSetById.get(selected.b) })}>
+                    Open {selected.bLabel} →
+                  </button>
+                </div>
+                <ConsolidatePairPane idx={idx} aId={selected.a} bId={selected.b} />
+              </>
+            ) : (
+              <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>
+                Select a pair on the left to see the grant-level comparison.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// §2.77 UX-59 — Duplicate PermSets tab.
+// Shows PermSets with identical grant signatures (Jaccard = 100%), clustered via union-find.
+// Left column = cluster list. Right column = cluster detail with member compare.
+function DuplicatePermSetsTab({ idx, overlapV26, setOverlapV26, consolidationMarks, setConsolidationMarks, nav }) {
+  // Lazy-trigger overlap computation if this tab is visited before RedundancyTab.
+  useEffect(() => {
+    if (overlapV26 == null && idx) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 10);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx]);
+  const [includeManaged, setIncludeManaged] = useState(false);
+  const [selectedCluster, setSelectedCluster] = useState(null); // string[] of Ids
+  const [comparePair, setComparePair]         = useState(null); // { a, b }
+
+  const clusters = useMemo(() => {
+    if (!overlapV26) return [];
+    const filtered = overlapV26.dups.filter(d => {
+      if (includeManaged) return true;
+      const a = idx.permSetById.get(d.a), b = idx.permSetById.get(d.b);
+      return (a && a.IsActionable) || (b && b.IsActionable);
+    });
+    return clusterExactDups(filtered);
+  }, [overlapV26, idx, includeManaged]);
+
+  // Reset compare pair when a new cluster is selected.
+  useEffect(() => {
+    if (selectedCluster && selectedCluster.length >= 2) {
+      setComparePair({ a: selectedCluster[0], b: selectedCluster[1] });
+    } else {
+      setComparePair(null);
+    }
+  }, [selectedCluster]);
+
+  const clusterKey = ids => ids.slice().sort().join("|");
+
+  const isClusterMarked = useCallback(ids => {
+    const k = clusterKey(ids);
+    return consolidationMarks.some(m => m.kind === "dup" && m.clusterKey === k);
+  }, [consolidationMarks]);
+
+  const toggleClusterMark = useCallback(ids => {
+    const k = clusterKey(ids);
+    if (isClusterMarked(ids)) {
+      setConsolidationMarks(prev => prev.filter(m => !(m.kind === "dup" && m.clusterKey === k)));
+    } else {
+      const labels = ids.map(id => idx.permSetById.get(id)?.Label || id);
+      setConsolidationMarks(prev => [...prev, { kind: "dup", clusterKey: k, ids, labels, markedAt: new Date().toISOString() }]);
+    }
+  }, [isClusterMarked, setConsolidationMarks, idx]);
+
+  const markedCount = consolidationMarks.filter(m => m.kind === "dup").length;
+
+  return (
+    <div style={{ padding: 24 }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+        <div style={{ fontWeight: 700, fontSize: 18 }}>Duplicate PermSets</div>
+        <Pill tone={clusters.length > 0 ? "red" : "green"}>{clusters.length} cluster{clusters.length !== 1 ? "s" : ""}</Pill>
+        {markedCount > 0 && <Pill tone="green">{markedCount} marked</Pill>}
+        <div style={{ flex: 1 }} />
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer", color: T.textMuted }}>
+          <input type="checkbox" checked={includeManaged} onChange={e => setIncludeManaged(e.target.checked)} />
+          Include managed packages
+        </label>
+      </div>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20 }}>
+        PermSets with identical grant signatures (Jaccard = 100%). Each cluster is a candidate
+        for consolidation — keep one, migrate users, delete the rest.
+      </div>
+
+      {!overlapV26 ? (
+        <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>
+          <span className="pe-spinner" style={{ marginRight: 10 }} />Calculating overlap…
+        </div>
+      ) : clusters.length === 0 ? (
+        <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>No duplicate PermSets detected.</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 20, alignItems: "start" }}>
+          {/* Left — cluster list */}
+          <div style={{ background: T.card, borderRadius: 12, padding: 10, maxHeight: 680, overflowY: "auto" }}>
+            {clusters.map((cluster, ci) => {
+              const isSel = selectedCluster && cluster.length === selectedCluster.length &&
+                cluster.every(id => selectedCluster.includes(id));
+              const marked = isClusterMarked(cluster);
+              const grantCount = grantorSignature(idx, cluster[0]).size;
+              return (
+                <div
+                  key={ci}
+                  className="pe-row"
+                  onClick={() => setSelectedCluster(cluster)}
+                  style={{
+                    padding: "10px 12px", cursor: "pointer", borderRadius: 8, marginBottom: 4,
+                    background: isSel ? T.cardHover : "transparent",
+                    borderLeft: isSel ? `3px solid ${T.accent}` : "3px solid transparent",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+                    <Pill tone="red">{cluster.length} dups</Pill>
+                    {marked && <Pill tone="green">✓</Pill>}
+                  </div>
+                  {cluster.map(id => {
+                    const ps = idx.permSetById.get(id);
+                    if (!ps) return null;
+                    return (
+                      <div key={id} style={{ fontSize: 12, padding: "1px 0", display: "flex", alignItems: "center", gap: 4 }}>
+                        <span>{ps.Label || ps.Name}</span>
+                        {ps.IsManaged && <span style={{ fontSize: 10, color: T.textDim }}>({ps.ManagedBy})</span>}
+                      </div>
+                    );
+                  })}
+                  <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>{grantCount} shared grants</div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Right — cluster detail */}
+          <div style={{ background: T.card, borderRadius: 12, padding: 20 }}>
+            {selectedCluster ? (
+              <>
+                {/* Action bar */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                  <button
+                    className="pe-btn"
+                    style={{ fontSize: 12, background: isClusterMarked(selectedCluster) ? T.green : T.accent }}
+                    onClick={() => toggleClusterMark(selectedCluster)}
+                  >
+                    {isClusterMarked(selectedCluster) ? "✓ Marked for consolidation" : "Mark for consolidation"}
+                  </button>
+                  {selectedCluster.map(id => {
+                    const ps = idx.permSetById.get(id);
+                    if (!ps) return null;
+                    return (
+                      <button key={id} className="pe-btn ghost" style={{ fontSize: 12 }}
+                        onClick={() => nav({ kind: "PermissionSet", item: ps })}>
+                        Open {ps.Label || ps.Name} →
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Pair picker (only shown for clusters with 3+ members) */}
+                {selectedCluster.length > 2 && (() => {
+                  const pairs = [];
+                  for (let i = 0; i < selectedCluster.length; i++)
+                    for (let j = i + 1; j < selectedCluster.length; j++)
+                      pairs.push([selectedCluster[i], selectedCluster[j]]);
+                  return (
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+                      <span style={{ fontSize: 11, color: T.textMuted }}>Compare pair:</span>
+                      {pairs.map(([idA, idB]) => {
+                        const aPs = idx.permSetById.get(idA);
+                        const bPs = idx.permSetById.get(idB);
+                        if (!aPs || !bPs) return null;
+                        const isSel = comparePair && comparePair.a === idA && comparePair.b === idB;
+                        return (
+                          <button key={`${idA}|${idB}`} className="pe-btn ghost"
+                            style={{ fontSize: 11, borderColor: isSel ? T.accent : undefined }}
+                            onClick={() => setComparePair({ a: idA, b: idB })}>
+                            {aPs.Label} vs {bPs.Label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
+                {/* Diff pane */}
+                {comparePair
+                  ? <ConsolidatePairPane idx={idx} aId={comparePair.a} bId={comparePair.b} />
+                  : <div style={{ color: T.textMuted, textAlign: "center", padding: 32 }}>Select a pair above to compare.</div>
+                }
+              </>
+            ) : (
+              <div style={{ textAlign: "center", padding: 48, color: T.textMuted }}>
+                Select a cluster on the left to see its members and grant comparison.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5033,6 +5806,15 @@ function AppStateProvider({ children }) {
   // UX-51 v2.7: expanded state for Subset extras rows.
   const [subsetExpanded, setSubsetExpanded] = useState({}); // "a|b" -> bool
 
+  // UX-58/59 v3.1: consolidation marks — persist through pebundle like dismissals.
+  // Shape: [{ key, category: "merge"|"duplicate", winner?, reason, at }]
+  // key for merge = "merge|<supersetId>|<subsetId>", for dup = "dup-mark|<aId>|<bId>"
+  const [consolidationMarks, setConsolidationMarks] = useState([]);
+
+  // UX-58/59 v3.1: selected consumer in Mergable tab + selected cluster in Duplicates tab.
+  const [mergableConsumer, setMergableConsumer] = useState(null);     // superset PS id
+  const [duplicateCluster, setDuplicateCluster] = useState(null);     // cluster index
+
   const resetAll = useCallback(() => {
     setExplorerSelection(null); setExplorerSearch("");
     setImpactFilterUser(""); setImpactFilterPs(""); setImpactFilterProfile("");
@@ -5048,6 +5830,9 @@ function AppStateProvider({ children }) {
     setCascadeObject({});
     setPrescribeUser(null); setPrescribeRows([]); setPrescribeRank(null);
     setSubsetExpanded({});
+    // v3.1 resets
+    setConsolidationMarks([]);
+    setMergableConsumer(null); setDuplicateCluster(null);
   }, []);
 
   const value = {
@@ -5080,6 +5865,10 @@ function AppStateProvider({ children }) {
     prescribeRows, setPrescribeRows,                    // UX-47
     prescribeRank, setPrescribeRank,                    // UX-47
     subsetExpanded, setSubsetExpanded,                  // UX-51
+    // v3.1 additions
+    consolidationMarks, setConsolidationMarks,          // UX-58/59
+    mergableConsumer, setMergableConsumer,              // UX-58
+    duplicateCluster, setDuplicateCluster,              // UX-59
     resetAll,
   };
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
@@ -5105,8 +5894,19 @@ export default function PermissionExplorer() {
   const [selection, setSelection] = useState(null);
   const [impactMatrix, setImpactMatrix] = useState(null);
   const [deleteCandidates, setDeleteCandidates] = useState(null);
+  // BUG-17 v3.0.2: Redundancy + Migration precomputes lifted to parent so Load
+  // All Computations can populate them. Tabs read from these via props and
+  // skip their lazy first-visit useEffects when populated.
+  const [overlap, setOverlap] = useState(null);
+  const [overlapV26, setOverlapV26] = useState(null);
+  const [orphans, setOrphans] = useState(null);
+  const [dead, setDead] = useState(null);
+  const [migrationData, setMigrationData] = useState(null);
   const [dismissals, setDismissals] = useState([]);
-  // v2.6 UX-20: Load All Computations — pre-builds Impact Matrix + Delete candidates + migration.
+  const [consolidationMarks, setConsolidationMarks] = useState([]); // UX-58/59 v3.1
+  // v2.6 UX-20 / BUG-17 v3.0.2: Load All Computations now pre-builds all six
+  // expensive precomputes (Impact Matrix, Delete candidates, four Redundancy
+  // precomputes, Migration similarity).
   const [computing, setComputing] = useState(false);
   const [computingProgress, setComputingProgress] = useState("");
 
@@ -5125,6 +5925,7 @@ export default function PermissionExplorer() {
         if (cached && datasetsHaveData(cached.datasets)) {
           setDatasets(cached.datasets);
           setDismissals(cached.dismissals || []);
+          setConsolidationMarks(cached.consolidationMarks || []);
           setSource("cache");
           setSourceTs(Date.now());
           setCachedAt(cached.cachedAt);
@@ -5160,7 +5961,11 @@ export default function PermissionExplorer() {
   const idx = useMemo(() => datasets ? buildIndexes(datasets) : null, [datasets]);
 
   // Invalidate precomputes whenever datasets change (UX-14)
-  useEffect(() => { setImpactMatrix(null); setDeleteCandidates(null); setSelection(null); }, [datasets]);
+  useEffect(() => {
+    setImpactMatrix(null); setDeleteCandidates(null); setSelection(null);
+    // BUG-17 v3.0.2: also clear Redundancy + Migration precomputes on dataset change.
+    setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
+  }, [datasets]);
   // v2.6 UX-21: context state reset is wired inside <AppStateProvider> via a child
   // effect that watches the datasets prop. A simpler signal is passed via the
   // `datasetEpoch` ref below so components can watch it and call `resetAll()`.
@@ -5205,7 +6010,7 @@ export default function PermissionExplorer() {
       if (cacheWriteTimerRef.current) clearTimeout(cacheWriteTimerRef.current);
       cacheWriteTimerRef.current = setTimeout(() => {
         cacheWriteTimerRef.current = null;
-        if (nextDatasets) idbWriteCache({ datasets: nextDatasets, dismissals });
+        if (nextDatasets) idbWriteCache({ datasets: nextDatasets, dismissals, consolidationMarks });
       }, 1500);
     } catch (err) {
       setBanner({ tone: "red", text: `Failed to read ${file.name}: ${err.message}` });
@@ -5220,12 +6025,13 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-04-v3.0.1",
+      appVersion: "2026-05-v3.1",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: datasets[f.key] || [],
         schema: (datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
       }])),
       dismissals,
+      consolidationMarks,
     };
     try {
       const blob = await gzipJSON(payload);
@@ -5237,7 +6043,7 @@ export default function PermissionExplorer() {
     } catch (err) {
       setBanner({ tone: "red", text: `Export failed: ${err.message}` });
     }
-  }, [datasets, dismissals]);
+  }, [datasets, dismissals, consolidationMarks]);
 
   // ---- Bundle import handler ----
   const onImportBundle = useCallback(async (file) => {
@@ -5253,15 +6059,17 @@ export default function PermissionExplorer() {
       const next = {};
       for (const f of FILES) next[f.key] = (obj.datasets && obj.datasets[f.key] && obj.datasets[f.key].rows) || [];
       const nextDismissals = Array.isArray(obj.dismissals) ? obj.dismissals : [];
+      const nextMarks = Array.isArray(obj.consolidationMarks) ? obj.consolidationMarks : [];
       setDatasets(next);
       setSource("bundle");
       setSourceTs(Date.now());
       setCachedAt(null);
       setUploadedAt({});
       setDismissals(nextDismissals);
+      setConsolidationMarks(nextMarks);
       setBanner({ tone: "green", text: `Bundle imported: ${file.name}.` });
       // Persist to IDB so the next session starts from this bundle automatically.
-      idbWriteCache({ datasets: next, dismissals: nextDismissals });
+      idbWriteCache({ datasets: next, dismissals: nextDismissals, consolidationMarks: nextMarks });
     } catch (err) {
       setBanner({ tone: "red", text: `Import failed — file not recognized as a valid bundle. Current data untouched. (${err.message})` });
     }
@@ -5273,9 +6081,12 @@ export default function PermissionExplorer() {
       setUploadedAt({});
       setUploadErrors({});
       setDismissals([]);
+      setConsolidationMarks([]);
       setCustomWarnings([]);
       setImpactMatrix(null);
       setDeleteCandidates(null);
+      // BUG-17 v3.0.2: clear lifted Redundancy + Migration precomputes too.
+      setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
       setDatasets(EMPTY_DATASETS);
       setSource("none");
       setSourceTs(Date.now());
@@ -5303,28 +6114,58 @@ export default function PermissionExplorer() {
     })();
   }, []);
 
-  // v2.6 UX-20: Load All Computations — precompute Impact Matrix + Delete candidates
-  // in sequence so admins can navigate to Change Impact / Redundancy instantly.
+  // v2.6 UX-20 / BUG-17 v3.0.2: Load All Computations now precomputes all six
+  // expensive operations across Change Impact, Overlap & Redundancy, and Migration
+  // tabs. State is lifted to this parent component, so the tabs read precomputed
+  // values from props and skip their lazy first-visit useEffects when populated.
   const onLoadAllComputations = useCallback(() => {
     if (!idx || computing) return;
     setComputing(true);
     setComputingProgress("Starting…");
     setTimeout(() => {
       try {
-        setComputingProgress("Phase 1/2 — Impact Matrix…");
+        setComputingProgress("Phase 1/4 — Impact Matrix…");
         const im = precomputeImpactMatrix(idx, (d, t) => {
-          if ((d & 255) === 0) setComputingProgress(`Phase 1/2 — Impact Matrix (${d}/${t})`);
+          if ((d & 255) === 0) setComputingProgress(`Phase 1/4 — Impact Matrix (${d}/${t})`);
         });
         setImpactMatrix(im);
-        setComputingProgress("Phase 2/2 — Delete candidates…");
+        setComputingProgress("Phase 2/4 — Delete candidates…");
         // Run on next tick so the UI can paint between phases.
         setTimeout(() => {
           try {
             const dc = precomputeDeleteCandidates(idx);
             setDeleteCandidates(dc);
-            setComputingProgress("");
-            setComputing(false);
-            setBanner({ tone: "green", text: `All computations complete — ${im.length.toLocaleString()} impact rows, ${dc.size.toLocaleString()} PermSets analyzed.` });
+            setComputingProgress("Phase 3/4 — Overlap & Redundancy…");
+            setTimeout(() => {
+              try {
+                const ov = precomputePermSetOverlap(idx);
+                setOverlap(ov);
+                const ov26 = precomputePermSetOverlapV26(idx);
+                setOverlapV26(ov26);
+                const orp = precomputeOrphans(idx);
+                setOrphans(orp);
+                const df = precomputeDeadFields(idx);
+                setDead(df);
+                setComputingProgress("Phase 4/4 — Migration similarity clusters…");
+                setTimeout(() => {
+                  try {
+                    const md = precomputeProfileSimilarity(idx);
+                    setMigrationData(md);
+                    setComputingProgress("");
+                    setComputing(false);
+                    setBanner({ tone: "green", text: `All computations complete — ${im.length.toLocaleString()} impact rows, ${dc.size.toLocaleString()} PermSets analyzed, ${ov.duplicates ? ov.duplicates.length : 0} duplicate clusters, ${orp.length} orphans, ${md.clusters.length} migration clusters.` });
+                  } catch (err) {
+                    setComputing(false);
+                    setComputingProgress("");
+                    setBanner({ tone: "red", text: `Computation failed in phase 4 (Migration): ${err.message}` });
+                  }
+                }, 30);
+              } catch (err) {
+                setComputing(false);
+                setComputingProgress("");
+                setBanner({ tone: "red", text: `Computation failed in phase 3 (Redundancy): ${err.message}` });
+              }
+            }, 30);
           } catch (err) {
             setComputing(false);
             setComputingProgress("");
@@ -5351,12 +6192,14 @@ export default function PermissionExplorer() {
   // depend on the index and would render empty / nonsensical content.
   const hasData = datasetsHaveData(datasets);
   const allTabs = [
-    { key: "explorer", label: "Explorer" },
-    { key: "impact", label: "Change Impact" },
-    { key: "prescribe", label: "Prescribe Access" },
+    { key: "explorer",   label: "Explorer" },
+    { key: "impact",     label: "Change Impact" },
+    { key: "prescribe",  label: "Prescribe Access" },
     { key: "redundancy", label: "Overlap & Redundancy" },
-    { key: "migration", label: "Migration" },
-    { key: "admin", label: "Admin" },
+    { key: "mergable",   label: "Mergable PermSets" },   // UX-58 v3.1
+    { key: "duplicates", label: "Duplicate PermSets" },  // UX-59 v3.1
+    { key: "migration",  label: "Migration" },
+    { key: "admin",      label: "Admin" },
   ];
   const tabs = hasData ? allTabs : allTabs.filter(t => t.key === "admin");
 
@@ -5390,7 +6233,7 @@ export default function PermissionExplorer() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ width: 24, height: 24, borderRadius: 6, background: `linear-gradient(135deg, ${T.accent}, ${T.purple})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12 }}>P</div>
             <div style={{ fontWeight: 700 }}>Permission Explorer</div>
-            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.0.1 · Salesforce</div>
+            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.1 · Salesforce</div>
           </div>
           <Tabs tabs={tabs} active={tab} onChange={setTab} />
           <div style={{ flex: 1 }} />
@@ -5430,8 +6273,22 @@ export default function PermissionExplorer() {
               deleteCandidates={deleteCandidates} setDeleteCandidates={setDeleteCandidates} />}
             {tab === "prescribe" && <PrescribeAccessTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }} />}
             {tab === "redundancy" && <RedundancyTab idx={idx} dismissals={dismissals} setDismissals={setDismissals}
+              overlap={overlap} setOverlap={setOverlap}
+              overlapV26={overlapV26} setOverlapV26={setOverlapV26}
+              orphans={orphans} setOrphans={setOrphans}
+              dead={dead} setDead={setDead}
+              nav={s => { setSelection(s); setTab("explorer"); }}
+              onNavToDelete={() => setTab("impact")} />}
+            {tab === "mergable" && <MergablePermSetsTab   /* UX-58 v3.1 */
+              idx={idx} overlapV26={overlapV26} setOverlapV26={setOverlapV26}
+              consolidationMarks={consolidationMarks} setConsolidationMarks={setConsolidationMarks}
               nav={s => { setSelection(s); setTab("explorer"); }} />}
-            {tab === "migration" && <MigrationTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }} />}
+            {tab === "duplicates" && <DuplicatePermSetsTab   /* UX-59 v3.1 */
+              idx={idx} overlapV26={overlapV26} setOverlapV26={setOverlapV26}
+              consolidationMarks={consolidationMarks} setConsolidationMarks={setConsolidationMarks}
+              nav={s => { setSelection(s); setTab("explorer"); }} />}
+            {tab === "migration" && <MigrationTab idx={idx} migrationData={migrationData} setMigrationData={setMigrationData}
+              nav={s => { setSelection(s); setTab("explorer"); }} />}
             {tab === "admin" && <AdminTab datasets={datasets} source={source} sourceTs={sourceTs} cachedAt={cachedAt}
               warnings={allWarnings} xrefWarnings={idx ? idx.xrefWarnings : []}
               uploadedAt={uploadedAt}
