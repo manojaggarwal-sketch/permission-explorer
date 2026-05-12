@@ -1543,7 +1543,7 @@ The customer-owned actionable set is `NamespacePrefix IS NULL AND IsCustom = tru
 
 - Actually deleting the PermSet from Salesforce. The artifact remains read-only; the user runs the actual delete in Salesforce Setup using the analysis as their justification.
 
-### 2.81 UX-63 — Simulation Mode (What-If) with Named Pebundle Export — DEFERRED, PLANNED FOR v3.1
+### 2.81 UX-63 — Simulation Mode (What-If) with Named Pebundle Export — IMPLEMENTED in v3.1 (see §2.86 for implementation details)
 
 > **Status:** Documented, not implemented. Surfaced when the user said "for change impact I want a way to simulate removing the permset from the user… if I remove the permset then it should 'disappear' and propagate throughout the app as if it were in the system but then be able to reset back to baseline. then also have an export pbundle that we can name for each test run."
 
@@ -1682,6 +1682,80 @@ Sample Field-grant audit for `SBQQ__QuoteLine__c.NEO_Overage_Price__c`:
 - Renaming `IsOwnedByProfile = true` rows to look more user-friendly. The implicit PermSets have synthetic names like `X00e3g0000012g62AAA` because Salesforce auto-generates them; the artifact already resolves these back to "Sales" in the Profile detail UI via the `ProfileId` join. No UX change needed.
 - Filtering implicit PermSets out of the PermSet entry-point list in the left sidebar. Currently the index builder splits implicit from regular and the sidebar should already exclude implicit (per BUG-8 v2.6). Verify this is working correctly in v3.0.2 acceptance testing.
 - Changing the v2.6 BUG-8 / v2.8 BUG-15 logic that handles the actual Profile→Object join in the renderer. That logic is correct; it just needs the implicit rows to be in the data to operate on.
+
+---
+
+### 2.83 BUG-20 — Migration Tab Hangs on Profile Clustering — IMPLEMENTED in v3.0.3
+
+> **Status:** Implemented in v3.0.3. Surfaced during v3.1 test run (T-27–T-31, T-35): profile clustering runs synchronously on the main thread with 1,037 users × 68 profiles × 758 PermSets and never completes within observable time (~30s+). Phase 4 of "Load All Computations" also silently fails.
+
+**Reason for change:** `precomputeProfileSimilarity` runs a pairwise O(n²) Jaccard comparison across all profiles. With Bullhorn's 68 profiles, each comparison involves iterating grant signatures of several hundred tokens. The synchronous loop blocks the main thread, preventing React state updates from painting and making the UI unresponsive.
+
+**Changes (implemented in v3.0.3):**
+
+1. Added `asyncChunked` utility: runs a generator function in batches via `setTimeout(0)`, yielding to the browser between chunks.
+2. Added `precomputeProfileSimilarityGen`: generator version of `precomputeProfileSimilarity` that yields after each outer-loop iteration.
+3. `MigrationTab` `useEffect` now calls `asyncChunked(() => precomputeProfileSimilarityGen(idx))` instead of the synchronous version.
+4. `onLoadAllComputations` Phase 4 uses the same async generator pattern.
+
+**Decision resolved:** `requestIdleCallback`-style chunking chosen over Web Worker (keeps everything in one file). Streaming render not needed — spinner shows until complete.
+
+---
+
+### 2.84 BUG-21 — Overlap & Redundancy Tab Freezes on Managed Filter Toggle — IMPLEMENTED in v3.0.3
+
+> **Status:** Implemented in v3.0.3. Regression introduced in v3.1 UX-57 managed filter work (T-07): toggling "Include managed-package & standard PermSets" on the Overlap & Redundancy tab hung the browser for 30+ seconds. The equivalent toggle on the Mergable tab completed in ~10s.
+
+**Reason for change:** `subsetsAnnotated` was computed inline in the render function, calling `subsetExtras` → `grantorSignature` twice per subset pair on every re-render. When the managed toggle changed, all ~4,000+ subset pairs were reprocessed synchronously. The Mergable tab's toggle was lighter because it only filters pre-computed data.
+
+**Changes (implemented in v3.0.3):**
+
+1. Extracted `subsetsAnnotated`, `reallySubsets`, `reclassifiedAsDup`, and `allDups` computation into a `useMemo` that depends only on `overlap` and `idx` — NOT on `includeManagedRedundancy`.
+2. The managed toggle now only triggers a lightweight filter re-render, not a full recomputation.
+
+**Decision resolved:** Combined with BUG-20 into a single async computation pass pattern. The memoization alone is sufficient for BUG-21 since the heavy work is now cached.
+
+---
+
+### 2.85 BUG-22 — consolidationMarks Not Persisted to IndexedDB — IMPLEMENTED in v3.0.3
+
+> **Status:** Implemented in v3.0.3. Surfaced during v3.1 test run (T-39): marks set in Mergable/Duplicate tabs survive tab navigation (React state) but are lost on page reload. IDB cache record contains only `{cachedAt, schemaVersion, pebundle: Blob}` — no marks key.
+
+**Reason for change:** The `consolidationMarks` state was only persisted inside the pebundle cache blob (embedded in the gzipped bundle). This means marks were only written to IDB when a CSV upload triggered the debounced cache write — marks set after the last upload were lost on reload.
+
+**Changes (implemented in v3.0.3):**
+
+1. Added separate IDB key `marks` at `PermissionExplorer/marks/current` for standalone marks persistence.
+2. Added `idbReadMarks()`, `idbWriteMarks()`, `idbClearMarks()` helper functions.
+3. Added a `useEffect` watching `consolidationMarks` that debounces (500ms) and writes to the separate IDB key on every change.
+4. On startup, marks are loaded from the separate IDB key (preferred) or fall back to the cache blob's embedded marks for backward compatibility.
+5. `onReset` clears both the cache and marks IDB keys.
+
+**Decision resolved:** Separate IDB key chosen over merged cache record (marks survive bundle re-imports without merge logic).
+
+---
+
+### 2.86 UX-63 — Simulation Mode (What-If) — IMPLEMENTED in v3.1
+
+> **Status:** Implemented in v3.1. Previously deferred (§2.81). Core simulation infrastructure with 4 mutation types, cascading propagation, banner, save/export, and simulation bundle import.
+
+**Changes (implemented in v3.1):**
+
+1. **State model.** Added `simulatedDatasets`, `simulation`, and `isSimulating` state to `PermissionExplorer`. `activeDatasets = isSimulating ? simulatedDatasets : datasets`. Index builds from `activeDatasets`.
+2. **Mutation helpers.** `cloneDatasets`, `applySimulationMutation`, `applyAllMutations` support 4 mutation types: `removePSA` (user+permset), `removeAllPSA` (all users from a permset), `deletePermSet` (full removal), `addPSA` (assign permset to user).
+3. **Cascading propagation.** Because idx rebuilds from `activeDatasets` via `useMemo`, all downstream analysis (User effective perms, PermSet assigned-user counts, Object/Field "granted by" lists, Impact Matrix) automatically reflects simulated state.
+4. **Header banner.** Yellow non-blocking banner shows "Simulating: <name> · N mutations" with "Save simulation" and "Reset to baseline" buttons.
+5. **Simulation actions on detail views.** PermSet detail: "Remove from all users", "Delete PermSet entirely", per-user "Simulate remove". User detail: "Add PermSet to <user>…" searchable picker.
+6. **Save simulation → named .pebundle export.** Includes simulation metadata block and `_baseline` slot for round-trip.
+7. **Import simulation bundles.** Recognized via `obj.simulation.isSimulation`; restores baseline from `_baseline` slot, sets simulated state, shows import banner with baseline date.
+8. **Precompute invalidation.** All precomputes are cleared on mutation or reset so they rebuild from the new active datasets.
+
+**Decision points resolved:**
+- (a) Simulation banner does not block destructive actions (kept simple for v3.1).
+- (b) Importing a simulation bundle loads the `_baseline` without strict matching (load regardless).
+- (c) No per-mutation undo/redo — Reset clears everything (atomic).
+- (d) Simulation state is NOT cached to IDB — it's session-only. Export to save.
+- (e) Stacked mutations allowed within a single session.
 
 ---
 
@@ -1885,7 +1959,7 @@ If a previously-exported CSV still contains portal rows, the app filters them de
 CRITICAL: must filter to active standard users. Unfiltered row count is 2,010,598 and will cause export tools to time out.
 
 ```
-SELECT PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard' ORDER BY AssigneeId
+SELECT Id, PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard' ORDER BY Id
 ```
 
 **Query 7 — Permission Set Group Members** → `PermissionSetGroupComponent.csv`
@@ -1893,7 +1967,7 @@ SELECT PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.
 Maps which PermSets belong to which PermSet Groups, including Muting PermSets.
 
 ```
-SELECT PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetGroup.MasterLabel FROM PermissionSetGroupComponent ORDER BY PermissionSetGroup.MasterLabel
+SELECT Id, PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetGroup.MasterLabel FROM PermissionSetGroupComponent ORDER BY PermissionSetGroup.MasterLabel
 ```
 
 **Query 8 — Object Permissions** → `ObjectPermissions.csv`
@@ -1901,7 +1975,7 @@ SELECT PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetG
 ~33k rows. Covers CRUD and View All / Modify All for every object across all profiles and PermSets.
 
 ```
-SELECT SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete, PermissionsViewAllRecords, PermissionsModifyAllRecords, ParentId, Parent.Name, Parent.IsOwnedByProfile FROM ObjectPermissions ORDER BY SobjectType
+SELECT Id, SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete, PermissionsViewAllRecords, PermissionsModifyAllRecords, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM ObjectPermissions ORDER BY SobjectType
 ```
 
 **Query 9 — Field Permissions** → `FieldPermissions.csv`
@@ -1909,13 +1983,13 @@ SELECT SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, Permiss
 ~318k rows, largest file (~100MB). Export tool must support pagination. Some tools require batching by SobjectType.
 
 ```
-SELECT Field, SobjectType, PermissionsRead, PermissionsEdit, ParentId, Parent.Name, Parent.IsOwnedByProfile FROM FieldPermissions ORDER BY SobjectType, Field
+SELECT Id, Field, SobjectType, PermissionsRead, PermissionsEdit, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM FieldPermissions ORDER BY SobjectType, Field
 ```
 
 **Query 10 — Tab Settings** → `PermissionSetTabSetting.csv`
 
 ```
-SELECT Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting ORDER BY Parent.Name, Name
+SELECT Id, Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting ORDER BY Parent.Name, Name
 ```
 
 **Query 11 — Setup Entity Access (Apex, VF, Custom Permissions, Apps)** → `SetupEntityAccess.csv`
@@ -1923,7 +1997,7 @@ SELECT Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting ORDE
 ~82k rows. Covers Apex class access, Visualforce page access, custom permission grants, and app visibility. Run as a single export or in four separate exports and concatenate.
 
 ```
-SELECT SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet') ORDER BY Parent.Name, SetupEntityType
+SELECT Id, SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet') ORDER BY Parent.Name, SetupEntityType
 ```
 
 **Query 12 — Custom Permissions** → `CustomPermission.csv`
@@ -2346,6 +2420,7 @@ This screen is the 5.2 Landing Screen from v1.9 of the spec. In v2.0+ it is repl
 | 2026-04-v2.9 | April 24 2026 | (Superseded by v3.0.) Replaced the embedded fallback (UX-54) with a repo-hosted `data/snapshot.json` fetched at runtime from `raw.githubusercontent.com`. Added bake-time fixes for v2.8 demo-dataset issues: round-robin user assignment across 10 standard profiles, UserRoleId referential-integrity enforcement, aggressive substring scrub for org-specific labels (`BH `, `_BH`, `Bullhorn`, `PNET`). The snapshot pipeline (`scripts/bake-snapshot.js`, `mcp-seed/raw/`, `docs/BAKE.md`) was added in this release and removed in v3.0. |
 | 2026-05-v3.0.2 | May 6 2026 | **Patch release — implemented.** Two items: **BUG-17** (§2.74): Extend `onLoadAllComputations` to cover all six expensive precomputes (Impact Matrix, Delete candidates, Overlap & Redundancy clusters, Subset detection, Orphans, Dead Fields, Migration similarity clusters) instead of only the first two. Lifts state to the parent component so RedundancyTab and MigrationTab read precomputed values from props and skip lazy first-visit `useEffect`s when populated. Adds Phase 3/4 to the Computing progress text. **BUG-19** (§2.82): Query 2 SOQL drift — §5.1 and the Cowork scheduled task prompt have been carrying `WHERE IsOwnedByProfile = false` plus omitting `ProfileId` since v2.5, while the JSX's internal SOQL was corrected in v2.6 BUG-8. Bundles built from the spec/scheduled-task SOQL miss the ~1-implicit-PermSet-per-Profile rows that ObjectPermissions / FieldPermissions hang their `ParentId` on for Profile-level grants. Result: every Profile detail view shows "0 Objects Granted / 0 Fields Granted" and Field detail Profile-Grant counts are artificially low (Bullhorn example: 40 of 42 grants on `SBQQ__QuoteLine__c.NEO_Overage_Price__c` are routed through implicit PermSets and were invisible in v3.0.1). Fix: drop the filter, add `ProfileId` to the SELECT in §5.1 and the scheduled task; re-fetch and rebuild bundle. No JSX index-builder changes required — the v2.6 BUG-8 fix already handles unfiltered data. Small, contained patch. |
 | 2026-05-v3.1 | May 11 2026 | **Feature release — implemented.** Seven items from the v3.1 backlog (UX-63 deferred to a future release): **UX-57** (§2.73): `NamespacePrefix` added to Query 2 SELECT; `IsManaged` / `ManagedBy` / `IsActionable` flags derived in `buildIndexes`; "Include managed packages" toggle (default OFF) added to Orphaned PermSets table, Delete Scenario B, and the two new consolidation tabs. **BUG-18** (§2.75): Confirmed no code change required — `precomputeDeadFields` was already correct after the BUG-19 data fix (implicit profile PermSets now present in Query 2 data). **UX-58** (§2.76): New "Mergable PermSets" tab — two-column layout with near-duplicate pairs (Jaccard ≥ 0.85 < 1.0) and strict subset pairs. Left column: pair list with Jaccard badge; right column: `ConsolidatePairPane` grant diff. "Mark for merge" persists `{ kind: "mergable", a, b, … }` to `consolidationMarks` state and `.pebundle`. **UX-59** (§2.77): New "Duplicate PermSets" tab — exact duplicates (Jaccard = 1.0) clustered via union-find (`clusterExactDups`). Left column: cluster list; right column: cluster detail with pair-picker for 3+ members. "Mark for consolidation" persists `{ kind: "dup", clusterKey, ids, … }` to `consolidationMarks`. **UX-60** (§2.78): New Query 14 (`SetupAuditTrail`) with `Action IN ('PermSetAssign','PermSetUnassign','PermSetGroupAssign','PermSetGroupUnassign')`; `auditTrailByPermSetLabel` index built in `buildIndexes` via `AUDIT_RE` regex; "Last activity" column on Orphaned PermSets table; 6-month retention caveat shown. **UX-61** (§2.79): `DormantProfilesBlock` component added to Migration tab — three sub-tables (Empty, Dormant, Single-User) with threshold slider (no pre-set), 100% dormancy rule, service-user hint flag. **UX-62** (§2.80): "Run Delete Impact Analysis →" button on each orphaned PermSet row; navigates to Change Impact tab with Scenario B pre-loaded. `consolidationMarks` state added to `AppStateProvider` and `PermissionExplorer` parent; round-trips through IDB cache, `.pebundle` export, and import. `appVersion` bumped to `2026-05-v3.1`. JSX header, runtime version pill, `package.json`, and `index.html` all updated to v3.1. |
-| 2026-05-planned-v3.1-UX63 | TBD | **Deferred — planned for future release.** **UX-63** (§2.81) Simulation Mode (what-if) with cascading propagation across the entire app and named `.pebundle` export per test run; baseline-vs-simulated dataset state at the top of `PermissionExplorer`; `simulation` metadata block in exported bundles for round-trip review. Deferred because it requires deep architectural changes to state management across all tabs. |
+| 2026-05-v3.0.3 | May 12 2026 | **Bug-fix patch — implemented.** Three blockers + one high: **BUG-20** (§2.83) Migration tab hang — `precomputeProfileSimilarity` rewritten as async generator with `asyncChunked` utility; MigrationTab and Load All Computations Phase 4 use the async version. **BUG-21** (§2.84) Redundancy tab freeze on managed-filter toggle — `subsetsAnnotated` computation memoized via `useMemo` to avoid re-running `subsetExtras` on every toggle re-render. **BUG-22** (§2.85) `consolidationMarks` not persisted to IDB — separate IDB key `marks` with debounced write `useEffect`; read on startup with backward-compat fallback to cache blob marks. **Banner fix:** `onLoadAllComputations` rewritten as async with `await yieldFrame()` between phases so banner state updates paint to DOM. |
+| 2026-05-v3.1-UX63 | May 12 2026 | **Feature — implemented.** **UX-63** (§2.81/§2.86) Simulation Mode (what-if). Adds `simulatedDatasets` / `simulation` state; `activeDatasets` drives `idx` rebuild; 4 mutation types (`removePSA`, `removeAllPSA`, `deletePermSet`, `addPSA`); cascading propagation via `useMemo`; yellow simulation banner with mutation count / save / reset; simulation `.pebundle` export with `_baseline` slot for round-trip; simulation bundle import recognition. Simulation actions added to PermSet detail (remove from all / delete entirely / per-user remove) and User detail (add PermSet picker). |
 | 2026-05-v3.0.1 | May 4 2026 | **Patch release — BUG-16 fix + DATA-1 SOQL expansion.** Resolves the Prescribe Access defect surfaced by the user trying to grant Transfer Record to Azam Malik. Two changes: (1) JSX `PrescribeAccessTab.allSysKeys` memo (line ~4057) drops the `if (v)` filter so the picker now shows every permission column known to the data, regardless of current truth value. (2) SOQL Query 1 (Profile) and Query 13 (PermissionSet system perms) expand SELECT to include `PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase` — verified to exist on both objects in the Bullhorn org. Updated in three places: JSX SOQL constants, requirements §5.1, and the `weekly-permission-explorer-bundle` Cowork scheduled task prompt. The current bundle (`permission-explorer_<latest>.pebundle`) was rebuilt with re-fetched Profile.csv and SystemPermissions_PermSet.csv so the new columns are present. Decision points 1–9 in §2.72 were resolved with smallest-reasonable-change choices: filter dropped to "show all known", three Transfer columns added (no broader 80-column enumeration), API field names retained (no friendly-name mapping), v3.0.1 patch versioning chosen over bundling with v3.1. README/index.html/package.json/JSX header all bumped to v3.0.1. Bundle `appVersion` field is now `2026-04-v3.0.1`. |
 | 2026-04-v3.0 | April 30 2026 | **Breaking architectural change.** Removed v2.9's repo-hosted runtime snapshot fetch entirely (ARCH-1). The artifact no longer makes any outbound network calls at runtime. Added IndexedDB pebundle cache with debounced auto-write after CSV upload or `.pebundle` import (ARCH-2). Added 14-day stale-cache banner (UX-55). Added tab gating so only Admin is reachable when no data is loaded (UX-56). Added the `weekly-permission-explorer-bundle` Cowork scheduled task that runs the 13 SOQL queries against the user's authed Salesforce production org weekly, paginates via uniform `Id > lastId` cursor, and produces 13 CSVs + 1 `.pebundle` in the user's Cowork folder (OPS-1). Added `scripts/build-pebundle.js` — a 265-line Node helper that reads 13 staging JSONL files, flattens nested SObject relationships (`row.Profile.Name` → `"Profile.Name"`), strips Salesforce `attributes` blobs, deduplicates by Id, writes 13 CSVs and one gzipped `.pebundle`, and atomically rotates prior outputs. `.gitignore` cleaned: dropped `mcp-seed/`, added `bundles/` and `*.pebundle` (OPS-2). README, JSX header, index.html bootstrap comment, and package.json all updated to v3.0 (DOC-1). Removed: `data/snapshot.json`, `scripts/bake-snapshot.js`, `scripts/build-fallback.js`, `docs/BAKE.md`, `mcp-seed/`, `GITHUB_SNAPSHOT_*` constants, `fetchGithubSnapshot()`, `snapshotMeta` state, `source === "github"` rendering branches. Added 7 acceptance criteria (ARCH-1, ARCH-2, UX-55, UX-56, OPS-1, OPS-2, DOC-1) and 3 main feature criteria (24, 25, 26). **Bug fix carried into v3.0**: Query 5 (UserRole) corrected from `WHERE PortalType = null` to `WHERE PortalType = 'None'`. The original filter shipped in v2.5–v2.9 returned zero rows in production orgs because Salesforce stores the literal picklist value `'None'` for internal roles, never SQL NULL. With the correct filter, Bullhorn returns 162 internal roles (matching the §3.4 reference count). Updated in JSX SOQL constants, error-message copy, requirements §2.14, §5.1, §6.3, §7.3 admin notice example, UX-12 acceptance criterion, and the Cowork scheduled task prompt. |

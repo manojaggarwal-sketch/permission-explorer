@@ -25,9 +25,22 @@
       row cross-links to the Delete Impact (Change Impact tab, Scenario B).
     - BUG-18: Dead Fields analysis confirmed correct after BUG-19 data fix —
       no code change needed; profile-level grants flow via implicit PS join.
+    - UX-63: Simulation Mode (what-if). Adds baselineDatasets /
+      simulatedDatasets state; mutations (add/remove PSA, delete PermSet)
+      cascade through the entire app via activeDatasets → idx rebuild.
+      Yellow simulation banner with mutation count, save-as-pebundle export,
+      and reset-to-baseline. Simulation bundles round-trip with _baseline slot.
+    - BUG-20 fix: Migration tab profile clustering uses async chunked
+      generator (requestIdleCallback pattern) — no more main-thread hang.
+    - BUG-21 fix: Redundancy tab subsetsAnnotated computation memoized via
+      useMemo — managed-filter toggle no longer re-runs expensive subsetExtras.
+    - BUG-22 fix: consolidationMarks persisted to separate IDB key
+      ('marks'); survives page reload and bundle re-import.
+    - Banner fix: Load All Computations rewritten as async with yield-frame
+      between phases; progress banners now paint to DOM during computation.
     - consolidationMarks: new pebundle-persisted state; round-trips through
       IDB cache, export, and import.
-    - See requirements_v3_0.md §2.73 through §2.80 for full specs.
+    - See requirements_v3_0.md §2.73 through §2.81 for full specs.
 
   v3.0.2 (patch) adds:
     - BUG-17 fix: "Load All Computations" now actually loads all six
@@ -326,17 +339,17 @@ const SOQL = {
   userRole:
     "SELECT Id, Name, DeveloperName, ParentRoleId, PortalType FROM UserRole WHERE PortalType = 'None' ORDER BY Name",
   psa:
-    "SELECT PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard' ORDER BY AssigneeId",
+    "SELECT Id, PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard' ORDER BY Id",
   psgc:
-    "SELECT PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetGroup.MasterLabel FROM PermissionSetGroupComponent ORDER BY PermissionSetGroup.MasterLabel",
+    "SELECT Id, PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetGroup.MasterLabel FROM PermissionSetGroupComponent ORDER BY PermissionSetGroup.MasterLabel",
   objectPerms:
-    "SELECT SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete, PermissionsViewAllRecords, PermissionsModifyAllRecords, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM ObjectPermissions ORDER BY SobjectType",
+    "SELECT Id, SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete, PermissionsViewAllRecords, PermissionsModifyAllRecords, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM ObjectPermissions ORDER BY SobjectType",
   fieldPerms:
-    "SELECT Field, SobjectType, PermissionsRead, PermissionsEdit, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM FieldPermissions ORDER BY SobjectType, Field",
+    "SELECT Id, Field, SobjectType, PermissionsRead, PermissionsEdit, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM FieldPermissions ORDER BY SobjectType, Field",
   tabs:
-    "SELECT Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting ORDER BY Parent.Name, Name",
+    "SELECT Id, Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting ORDER BY Parent.Name, Name",
   setup:
-    "SELECT SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet') ORDER BY Parent.Name, SetupEntityType",
+    "SELECT Id, SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet') ORDER BY Parent.Name, SetupEntityType",
   customPerm:
     "SELECT Id, DeveloperName, MasterLabel FROM CustomPermission ORDER BY MasterLabel",
   sysPerms:
@@ -534,12 +547,181 @@ async function idbClearCache() {
   }
 }
 
+// BUG-22 v3.0.3: Separate IDB key for consolidationMarks so they survive
+// page reloads and bundle re-imports without merge logic.
+const IDB_MARKS_KEY = "marks";
+
+async function idbReadMarks() {
+  const db = await idbOpen();
+  if (!db) return [];
+  try {
+    const record = await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(IDB_MARKS_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+    db.close();
+    if (!record || !Array.isArray(record.marks)) return [];
+    return record.marks;
+  } catch {
+    try { db.close(); } catch {}
+    return [];
+  }
+}
+
+async function idbWriteMarks(marks) {
+  const db = await idbOpen();
+  if (!db) return false;
+  try {
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      const req = tx.objectStore(IDB_STORE).put({ marks: marks || [], updatedAt: new Date().toISOString() }, IDB_MARKS_KEY);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    });
+    db.close();
+    return true;
+  } catch {
+    try { db.close(); } catch {}
+    return false;
+  }
+}
+
+async function idbClearMarks() {
+  const db = await idbOpen();
+  if (!db) return false;
+  try {
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      const req = tx.objectStore(IDB_STORE).delete(IDB_MARKS_KEY);
+      req.onsuccess = () => resolve(true);
+      req.onerror = () => resolve(false);
+    });
+    db.close();
+    return true;
+  } catch {
+    try { db.close(); } catch {}
+    return false;
+  }
+}
+
 // Days between two ISO timestamps. Returns Infinity if either is unparseable.
 function ageInDays(isoTs) {
   if (!isoTs) return Infinity;
   const t = Date.parse(isoTs);
   if (!Number.isFinite(t)) return Infinity;
   return (Date.now() - t) / (24 * 3600 * 1000);
+}
+
+// BUG-20/21 v3.0.3: Async chunked computation utility. Runs a heavy O(n²) loop
+// in batches via setTimeout(0), yielding to the browser between chunks so the UI
+// stays responsive. Returns a Promise that resolves with the final result.
+// `workFn(onChunkDone)` receives a callback; the worker calls it periodically
+// with progress info. The wrapper yields after each call.
+function asyncChunked(workFn) {
+  return new Promise((resolve) => {
+    // workFn is expected to be a generator function* that yields periodically.
+    const gen = workFn();
+    function step() {
+      const { value, done } = gen.next();
+      if (done) { resolve(value); return; }
+      setTimeout(step, 0);
+    }
+    setTimeout(step, 0);
+  });
+}
+
+// BUG-20 v3.0.3: Async version of precomputeProfileSimilarity.
+// Uses a generator that yields after processing each profile's row of the
+// pairwise comparison matrix, keeping the main thread unblocked.
+function* precomputeProfileSimilarityGen(idx) {
+  const profs = [...idx.profileById.values()];
+  const sigs = profs.map(p => ({ id: p.Id, name: p.Name, sig: grantorSignature(idx, p.Id) }));
+  const pairs = [];
+  const adj = new Map();
+  for (let i = 0; i < sigs.length; i++) {
+    for (let j = i + 1; j < sigs.length; j++) {
+      const s = jaccard(sigs[i].sig, sigs[j].sig);
+      if (s >= 0.7) {
+        pairs.push({ a: sigs[i].id, aName: sigs[i].name, b: sigs[j].id, bName: sigs[j].name, score: s });
+        if (!adj.has(sigs[i].id)) adj.set(sigs[i].id, new Set());
+        if (!adj.has(sigs[j].id)) adj.set(sigs[j].id, new Set());
+        adj.get(sigs[i].id).add(sigs[j].id); adj.get(sigs[j].id).add(sigs[i].id);
+      }
+    }
+    // Yield after each outer-loop iteration to keep UI responsive.
+    yield;
+  }
+  // Build connected components
+  const seen = new Set();
+  const clusters = [];
+  for (const n of adj.keys()) {
+    if (seen.has(n)) continue;
+    const stack = [n]; const cluster = [];
+    while (stack.length) {
+      const x = stack.pop();
+      if (seen.has(x)) continue;
+      seen.add(x); cluster.push(x);
+      for (const y of adj.get(x) || []) if (!seen.has(y)) stack.push(y);
+    }
+    if (cluster.length > 1) clusters.push(cluster.map(id => ({ id, name: idx.profileById.get(id).Name })));
+  }
+  return { pairs, clusters, sigs };
+}
+
+// BUG-21 v3.0.3: Async versions of overlap precomputes for the Redundancy tab toggle.
+function* precomputePermSetOverlapGen(idx) {
+  const entries = [];
+  for (const ps of idx.permSetById.values())
+    entries.push({ id: ps.Id, label: ps.Label, sig: grantorSignature(idx, ps.Id) });
+  const dups = [];
+  const subsets = [];
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const a = entries[i], b = entries[j];
+      if (a.sig.size === 0 || b.sig.size === 0) continue;
+      const aInB = [...a.sig].every(x => b.sig.has(x));
+      const bInA = [...b.sig].every(x => a.sig.has(x));
+      if (aInB && bInA) dups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label });
+      else if (aInB) subsets.push({ subsetId: a.id, subsetLabel: a.label, supersetId: b.id, supersetLabel: b.label });
+      else if (bInA) subsets.push({ subsetId: b.id, subsetLabel: b.label, supersetId: a.id, supersetLabel: a.label });
+    }
+    if ((i & 15) === 0) yield; // yield every 16 rows
+  }
+  return { dups, subsets, entries };
+}
+
+function* precomputePermSetOverlapV26Gen(idx) {
+  const entries = [];
+  for (const ps of idx.permSetById.values())
+    entries.push({ id: ps.Id, label: ps.Label, sig: grantorSignature(idx, ps.Id) });
+  const dups = [], nearDups = [], subsets = [];
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const a = entries[i], b = entries[j];
+      if (a.sig.size === 0 || b.sig.size === 0) continue;
+      const aInB = [...a.sig].every(x => b.sig.has(x));
+      const bInA = [...b.sig].every(x => a.sig.has(x));
+      const inter = [...a.sig].filter(x => b.sig.has(x)).length;
+      const uni = a.sig.size + b.sig.size - inter;
+      const score = uni === 0 ? 0 : inter / uni;
+      if (aInB && bInA) {
+        dups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label, score: 1, sharedCount: a.sig.size });
+      } else if (aInB) {
+        subsets.push({ subsetId: a.id, subsetLabel: a.label, supersetId: b.id, supersetLabel: b.label });
+      } else if (bInA) {
+        subsets.push({ subsetId: b.id, subsetLabel: b.label, supersetId: a.id, supersetLabel: a.label });
+      } else if (score >= 0.85) {
+        const aOnly = [...a.sig].filter(x => !b.sig.has(x));
+        const bOnly = [...b.sig].filter(x => !a.sig.has(x));
+        nearDups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label, score, aOnly, bOnly, shared: inter });
+      }
+    }
+    if ((i & 15) === 0) yield; // yield every 16 rows
+  }
+  nearDups.sort((x, y) => y.score - x.score);
+  return { dups, nearDups, subsets, entries };
 }
 
 /* ============================================================================
@@ -2385,7 +2567,7 @@ function ProfileDiagnosticsPanel({ idx, profile, fanoutIds, implicitPsId }) {
   );
 }
 
-function PermSetDetail({ idx, permSet, nav }) {
+function PermSetDetail({ idx, permSet, nav, isSimulating, onSimulationMutate }) {
   // UX-7 Assigned users, direct + via group.
   const directRows = (idx.psaByPermSet.get(permSet.Id) || []).filter(a => !a.GroupId);
   const viaGroupRows = (idx.psaByPermSet.get(permSet.Id) || []).filter(a => a.GroupId);
@@ -2396,13 +2578,13 @@ function PermSetDetail({ idx, permSet, nav }) {
   for (const a of directRows) {
     if (seen.has(a.UserId)) continue;
     const u = userByA(a); if (!u) continue;
-    assignedRows.push({ Id: u.Id, Name: u.Name, Email: u.Email, Profile: u["Profile.Name"], Via: "Direct", u });
+    assignedRows.push({ Id: u.Id, Name: u.Name, Email: u.Email, Profile: u["Profile.Name"], Via: "Direct", u, _simulated: a._simulated });
     seen.add(a.UserId);
   }
   for (const a of viaGroupRows) {
     const u = userByA(a); if (!u) continue;
     const g = idx.groupById.get(a.GroupId);
-    assignedRows.push({ Id: `${u.Id}|${a.GroupId}`, Name: u.Name, Email: u.Email, Profile: u["Profile.Name"], Via: `via ${g ? g.MasterLabel : a.GroupId}`, u });
+    assignedRows.push({ Id: `${u.Id}|${a.GroupId}`, Name: u.Name, Email: u.Email, Profile: u["Profile.Name"], Via: `via ${g ? g.MasterLabel : a.GroupId}`, u, _simulated: a._simulated });
   }
 
   return (
@@ -2413,6 +2595,7 @@ function PermSetDetail({ idx, permSet, nav }) {
           <Pill key="t" tone="purple">PermSet</Pill>,
           permSet.Type === "Muting" && <Pill key="m" tone="red">Muting</Pill>,
           toBool(permSet.IsCustom) && <Pill key="c" tone="accent">Custom</Pill>,
+          isSimulating && <Pill key="sim" tone="yellow">Simulating</Pill>,
         ].filter(Boolean)} />
       <StatsRow stats={[
         { label: "Assigned users", value: assignedRows.length, tone: "cyan" },
@@ -2420,11 +2603,37 @@ function PermSetDetail({ idx, permSet, nav }) {
         { label: "Fields granted", value: (idx.fieldPermsByParent.get(permSet.Id) || []).length, tone: "accent" },
       ]} />
 
+      {/* UX-63 v3.1: Simulation action buttons */}
+      {onSimulationMutate && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, padding: "8px 0", borderBottom: `1px solid ${T.border}` }}>
+          <span style={{ fontSize: 11, color: T.textMuted, lineHeight: "28px" }}>Simulate:</span>
+          {assignedRows.length > 0 && (
+            <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => {
+              if (window.confirm(`Remove ${permSet.Label} from all ${assignedRows.length} assigned user(s)?`)) {
+                onSimulationMutate({ type: "removeAllPSA", permSetId: permSet.Id, label: permSet.Label });
+              }
+            }}>Remove from all users</button>
+          )}
+          <button className="pe-btn ghost" style={{ fontSize: 11, color: T.red }} onClick={() => {
+            if (window.confirm(`Delete ${permSet.Label} entirely? This removes it from all users, groups, and all its object/field/system permissions.`)) {
+              onSimulationMutate({ type: "deletePermSet", permSetId: permSet.Id, label: permSet.Label });
+            }
+          }}>Delete PermSet entirely</button>
+        </div>
+      )}
+
       <SubSectionTable title="Assigned Users" rows={assignedRows} columns={[
-        { key: "Name", label: "Name", render: r => <span onClick={e => { e.stopPropagation(); nav({ kind: "User", item: r.u }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Name}</span> },
+        { key: "Name", label: "Name", render: r => <span onClick={e => { e.stopPropagation(); nav({ kind: "User", item: r.u }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Name}{r._simulated ? " (simulated)" : ""}</span> },
         { key: "Email", label: "Email" },
         { key: "Profile", label: "Profile" },
         { key: "Via", label: "Source", render: r => r.Via === "Direct" ? <Pill tone="green">Direct</Pill> : <Pill tone="cyan">{r.Via}</Pill> },
+        // UX-63: per-user simulation remove button.
+        ...(onSimulationMutate ? [{ key: "_sim", label: "", render: r => (
+          r.Via === "Direct" ? <button className="pe-btn ghost" style={{ fontSize: 10, color: T.red, padding: "2px 6px" }} onClick={e => {
+            e.stopPropagation();
+            onSimulationMutate({ type: "removePSA", permSetId: permSet.Id, userId: r.u.Id, label: `${permSet.Label} from ${r.Name}` });
+          }}>Simulate remove</button> : null
+        ) }] : []),
       ]} getRowId={r => r.Id} emptyText="No active standard users assigned." />
 
       <ParentDetailSubSections idx={idx} parentId={permSet.Id}
@@ -2509,7 +2718,65 @@ function GroupAggregate({ idx, group, nav }) {
 }
 
 // User detail — provenance + muted (UX-8)
-function UserDetail({ idx, user, nav }) {
+// UX-63 v3.1: Simulation action — add PermSet to user via searchable dropdown.
+function SimulateAddPermSetButton({ idx, user, onSimulationMutate }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const allPs = useMemo(() =>
+    [...idx.permSetById.values()]
+      .filter(ps => !toBool(ps.IsOwnedByProfile))
+      .map(ps => ({ id: ps.Id, label: ps.Label, name: ps.Name }))
+      .sort((a, b) => (a.label || "").localeCompare(b.label || "")),
+  [idx]);
+  const filtered = q ? allPs.filter(ps =>
+    (ps.label || "").toLowerCase().includes(q.toLowerCase()) ||
+    (ps.name || "").toLowerCase().includes(q.toLowerCase())
+  ) : allPs;
+
+  if (!open) return (
+    <div style={{ marginBottom: 12, padding: "8px 0", borderBottom: `1px solid ${T.border}` }}>
+      <span style={{ fontSize: 11, color: T.textMuted, marginRight: 8 }}>Simulate:</span>
+      <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => setOpen(true)}>Add PermSet to {user.Name}…</button>
+    </div>
+  );
+
+  return (
+    <div style={{ marginBottom: 12, padding: "8px 0", borderBottom: `1px solid ${T.border}` }}>
+      <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>Simulate adding PermSet to {user.Name}:</div>
+      <input type="text" placeholder="Search permission sets…" value={q} onChange={e => setQ(e.target.value)}
+        style={{ width: "100%", maxWidth: 400, padding: "6px 10px", fontSize: 12, border: `1px solid ${T.border}`, borderRadius: 6, background: T.bgAlt, color: T.text, marginBottom: 4 }}
+        autoFocus />
+      <div style={{ maxHeight: 200, overflow: "auto", border: `1px solid ${T.border}`, borderRadius: 6, background: T.card }}>
+        {filtered.slice(0, 100).map(ps => (
+          <div key={ps.id} style={{ padding: "4px 10px", fontSize: 11, cursor: "pointer", borderBottom: `1px solid ${T.border}` }}
+            onClick={() => {
+              onSimulationMutate({
+                type: "addPSA",
+                permSetId: ps.id,
+                permSetName: ps.name,
+                permSetLabel: ps.label,
+                userId: user.Id,
+                userName: user.Name,
+                userUsername: user.Username,
+                userProfileId: user.ProfileId,
+                label: `Add ${ps.label} to ${user.Name}`,
+              });
+              setOpen(false);
+              setQ("");
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = T.bgAlt}
+            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+            {ps.label} <span style={{ color: T.textMuted }}>({ps.name})</span>
+          </div>
+        ))}
+        {filtered.length === 0 && <div style={{ padding: 8, color: T.textMuted, fontSize: 11 }}>No matches.</div>}
+      </div>
+      <button className="pe-btn ghost" style={{ fontSize: 11, marginTop: 4 }} onClick={() => { setOpen(false); setQ(""); }}>Cancel</button>
+    </div>
+  );
+}
+
+function UserDetail({ idx, user, nav, isSimulating, onSimulationMutate }) {
   const sources = userSources(idx, user.Id);
   const effObjects = effectiveObjects(idx, user.Id);
   const { grant: effFields, mute: muteFields } = effectiveFields(idx, user.Id);
@@ -2566,6 +2833,11 @@ function UserDetail({ idx, user, nav }) {
         { label: "Effective fields", value: fieldRows.length, tone: "accent" },
         { label: "Muted fields", value: mutedRows.length, tone: "red" },
       ]} />
+
+      {/* UX-63 v3.1: Simulation action — add PermSet to this user */}
+      {onSimulationMutate && (
+        <SimulateAddPermSetButton idx={idx} user={user} onSimulationMutate={onSimulationMutate} />
+      )}
 
       <SubSectionTable title="Permission Sources" rows={sources} columns={[
         { key: "kind", label: "Kind", render: s => <Pill tone={s.kind === "muting" ? "red" : s.kind === "profile" ? "purple" : "cyan"}>{s.kind}</Pill> },
@@ -3002,7 +3274,7 @@ const ENTRY_POINTS = [
   { key: "CustomPermission", label: "Custom Permissions", icon: "✦", tone: "orange" },
 ];
 
-function ExplorerTab({ idx, selection, setSelection }) {
+function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationMutate }) {
   const [entry, setEntry] = useState(selection ? selection.kind : "User");
   useEffect(() => { if (selection && selection.kind !== entry) setEntry(selection.kind); /* keep in sync */ }, [selection]);
   const [q, setQ] = useState("");
@@ -3115,9 +3387,9 @@ function ExplorerTab({ idx, selection, setSelection }) {
 
       <div style={{ overflow: "auto", padding: 24 }}>
         {!selection ? <Empty text={`Pick ${entry === "User" || entry === "Object" || entry === "Field" ? "a " : "a "}${entry} to begin.`} /> : (
-          selection.kind === "User" ? <UserDetail idx={idx} user={selection.item} nav={setSelection} /> :
+          selection.kind === "User" ? <UserDetail idx={idx} user={selection.item} nav={setSelection} isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} /> :
           selection.kind === "Profile" ? <ProfileDetail idx={idx} profile={selection.item} nav={setSelection} /> :
-          selection.kind === "PermissionSet" ? <PermSetDetail idx={idx} permSet={selection.item} nav={setSelection} /> :
+          selection.kind === "PermissionSet" ? <PermSetDetail idx={idx} permSet={selection.item} nav={setSelection} isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} /> :
           selection.kind === "PermissionSetGroup" ? <GroupDetail idx={idx} group={selection.item} nav={setSelection} /> :
           selection.kind === "Object" ? <ObjectDetail idx={idx} obj={selection.item} nav={setSelection} /> :
           selection.kind === "Field" ? <FieldDetail idx={idx} field={selection.item} nav={setSelection} /> :
@@ -4693,6 +4965,25 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
   };
   const undismiss = key => setDismissals(dismissals.filter(d => d.key !== key));
 
+  // BUG-21 v3.0.3: memoize the expensive subsetsAnnotated computation so it only
+  // reruns when overlap or idx change — NOT on every managed-toggle re-render.
+  // This was the root cause of the 30s+ hang: subsetExtras calls grantorSignature
+  // twice per subset pair, and was recomputed inline on every render.
+  const { reallySubsets, reclassifiedAsDup, allDups } = useMemo(() => {
+    if (!overlap) return { reallySubsets: [], reclassifiedAsDup: [], allDups: [] };
+    const subsetsAnnotated = (overlap.subsets || []).map(s => ({
+      ...s,
+      extras: subsetExtras(idx, s.subsetId, s.supersetId),
+    }));
+    const rs = subsetsAnnotated.filter(s => s.extras.total > 0);
+    const rd = subsetsAnnotated.filter(s => s.extras.total === 0).map(s => ({
+      a: s.subsetId, b: s.supersetId,
+      aLabel: s.subsetLabel, bLabel: s.supersetLabel,
+      reclassified: true,
+    }));
+    return { reallySubsets: rs, reclassifiedAsDup: rd, allDups: [...(overlap.dups || []), ...rd] };
+  }, [overlap, idx]);
+
   return (
     <div style={{ padding: "24px clamp(16px, 2vw, 48px)", width: "100%", boxSizing: "border-box", margin: "0 auto" }}>
       <HeaderBlock title="Overlap & Redundancy" subtitle="Consolidation opportunities across profiles and permission sets."
@@ -4706,18 +4997,6 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
       </div>
 
       {!overlap ? <div style={{ padding: 40, textAlign: "center" }}><span className="pe-spinner" /> Computing…</div> : (() => {
-        // UX-51 v2.7: compute extras per subset row, then auto-reclassify any
-        // zero-extras rows into the Duplicates bucket (per acceptance criterion).
-        const subsetsAnnotated = (overlap.subsets || []).map(s => ({
-          ...s,
-          extras: subsetExtras(idx, s.subsetId, s.supersetId),
-        }));
-        const reallySubsets = subsetsAnnotated.filter(s => s.extras.total > 0);
-        const reclassifiedAsDup = subsetsAnnotated.filter(s => s.extras.total === 0).map(s => ({
-          a: s.subsetId, b: s.supersetId,
-          aLabel: s.subsetLabel, bLabel: s.supersetLabel,
-          reclassified: true,
-        }));
         // UX-57 v3.1: filter managed/standard PermSets from actionable analysis lists.
         const managedFilter = r => {
           if (includeManagedRedundancy) return true;
@@ -4729,7 +5008,6 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
           const psA = idx.permSetById.get(r.a); const psB = idx.permSetById.get(r.b);
           return includeManagedRedundancy || ((psA ? psA.IsActionable : true) && (psB ? psB.IsActionable : true));
         };
-        const allDups = [...(overlap.dups || []), ...reclassifiedAsDup];
         return (
         <>
           <SubSectionTable title="Duplicate PermSets" rows={allDups.filter(d => !isDismissed(`dup|${d.a}|${d.b}`) && dupManagedFilter(d))} columns={[
@@ -5086,12 +5364,19 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
  * ==========================================================================*/
 function MigrationTab({ idx, nav, migrationData: migrationDataProp, setMigrationData: setMigrationDataProp }) {
   // BUG-17 v3.0.2: precompute state lifted to parent. Skip lazy compute if populated.
+  // BUG-20 v3.0.3: use async chunked generator to avoid main-thread hang.
   const [dataLocal, setDataLocal] = useState(null);
   const data = migrationDataProp !== undefined ? migrationDataProp : dataLocal;
   const setData = setMigrationDataProp || setDataLocal;
   const [focus, setFocus] = useState(null);
   useEffect(() => {
-    if (data == null) setTimeout(() => setData(precomputeProfileSimilarity(idx)), 20);
+    if (data == null) {
+      let cancelled = false;
+      asyncChunked(() => precomputeProfileSimilarityGen(idx)).then(result => {
+        if (!cancelled) setData(result);
+      });
+      return () => { cancelled = true; };
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx]);
   if (!data) return <div style={{ padding: 40, textAlign: "center" }}><span className="pe-spinner" /> Clustering profiles…</div>;
@@ -5751,6 +6036,100 @@ function validateCsv(fileMeta, headers, rows) {
 // v2.6 UX-21: AppStateContext — holds tab-scoped UI state so selections, filters,
 // sorts, and workflow progress survive tab switches without hitting localStorage
 // (which is blocked in the sandboxed iframe).
+
+/* ============================================================================
+ * UX-63 v3.1: SIMULATION MODE (WHAT-IF) HELPERS
+ * Mutations are applied to a deep-clone of the baseline datasets. Each mutation
+ * is a small descriptor: { type, permSetId?, userId?, ... }. The applyMutation
+ * function returns a new datasets object with the mutation applied.
+ * ==========================================================================*/
+
+// Deep-clone datasets (only the arrays that matter — rows are plain objects).
+function cloneDatasets(ds) {
+  const out = {};
+  for (const k of Object.keys(ds)) {
+    out[k] = ds[k] ? ds[k].map(r => ({ ...r })) : [];
+  }
+  return out;
+}
+
+// Apply a single mutation to a datasets clone. Returns the mutated clone.
+function applySimulationMutation(ds, mutation) {
+  const next = cloneDatasets(ds);
+  switch (mutation.type) {
+    case "removePSA": {
+      // Remove a specific PermissionSetAssignment row (user + permset).
+      next.PermissionSetAssignment = next.PermissionSetAssignment.filter(
+        r => !(r.PermissionSetId === mutation.permSetId && r.AssigneeId === mutation.userId)
+      );
+      break;
+    }
+    case "removeAllPSA": {
+      // Remove ALL PSA rows for a given PermSet.
+      next.PermissionSetAssignment = next.PermissionSetAssignment.filter(
+        r => r.PermissionSetId !== mutation.permSetId
+      );
+      break;
+    }
+    case "deletePermSet": {
+      // Remove all PSA rows + remove from PermissionSetGroupComponent + remove the PermSet itself.
+      next.PermissionSetAssignment = next.PermissionSetAssignment.filter(
+        r => r.PermissionSetId !== mutation.permSetId
+      );
+      next.PermissionSetGroupComponent = (next.PermissionSetGroupComponent || []).filter(
+        r => r.PermissionSetId !== mutation.permSetId
+      );
+      next.PermissionSet = next.PermissionSet.filter(
+        r => r.Id !== mutation.permSetId
+      );
+      // Also remove ObjectPermissions, FieldPermissions, SystemPermissions for this PermSet.
+      next.ObjectPermissions = next.ObjectPermissions.filter(r => r.ParentId !== mutation.permSetId);
+      next.FieldPermissions = next.FieldPermissions.filter(r => r.ParentId !== mutation.permSetId);
+      next.SystemPermissions_PermSet = (next.SystemPermissions_PermSet || []).filter(r => r.Id !== mutation.permSetId);
+      break;
+    }
+    case "addPSA": {
+      // Add a synthetic PSA row (assign PermSet to user).
+      next.PermissionSetAssignment = [
+        ...next.PermissionSetAssignment,
+        {
+          Id: `SIM_PSA_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          PermissionSetId: mutation.permSetId,
+          "PermissionSet.Name": mutation.permSetName || "",
+          "PermissionSet.Label": mutation.permSetLabel || "",
+          "PermissionSet.IsOwnedByProfile": "false",
+          AssigneeId: mutation.userId,
+          "Assignee.Name": mutation.userName || "",
+          "Assignee.Username": mutation.userUsername || "",
+          "Assignee.ProfileId": mutation.userProfileId || "",
+          IsActive: "true",
+          _simulated: true,
+        }
+      ];
+      break;
+    }
+    default:
+      break;
+  }
+  return next;
+}
+
+// Apply a full list of mutations sequentially.
+function applyAllMutations(baselineDs, mutations) {
+  let ds = cloneDatasets(baselineDs);
+  for (const m of mutations) ds = applySimulationMutation(ds, m);
+  return ds;
+}
+
+// Slugify a simulation name for export filename.
+function slugify(str) {
+  return (str || "simulation")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 60) || "simulation";
+}
+
 const AppStateContext = createContext(null);
 function useAppState() {
   const ctx = useContext(AppStateContext);
@@ -5904,6 +6283,16 @@ export default function PermissionExplorer() {
   const [migrationData, setMigrationData] = useState(null);
   const [dismissals, setDismissals] = useState([]);
   const [consolidationMarks, setConsolidationMarks] = useState([]); // UX-58/59 v3.1
+
+  // UX-63 v3.1: Simulation Mode (what-if). simulatedDatasets is a clone of
+  // datasets with mutations applied. When active, all idx/analysis reads from
+  // simulatedDatasets instead of (baseline) datasets.
+  const [simulatedDatasets, setSimulatedDatasets] = useState(null);
+  const [simulation, setSimulation] = useState(null); // { name, type, target, createdAt, mutations }
+  const isSimulating = !!simulatedDatasets;
+  // The active datasets drive idx and all downstream analysis.
+  const activeDatasets = isSimulating ? simulatedDatasets : datasets;
+
   // v2.6 UX-20 / BUG-17 v3.0.2: Load All Computations now pre-builds all six
   // expensive precomputes (Impact Matrix, Delete candidates, four Redundancy
   // precomputes, Migration similarity).
@@ -5920,12 +6309,14 @@ export default function PermissionExplorer() {
     let cancelled = false;
     (async () => {
       try {
-        const cached = await idbReadCache();
+        const [cached, savedMarks] = await Promise.all([idbReadCache(), idbReadMarks()]);
         if (cancelled) return;
         if (cached && datasetsHaveData(cached.datasets)) {
           setDatasets(cached.datasets);
           setDismissals(cached.dismissals || []);
-          setConsolidationMarks(cached.consolidationMarks || []);
+          // BUG-22 v3.0.3: prefer marks from the separate IDB key; fall back
+          // to marks embedded in the cache blob for backward compat.
+          setConsolidationMarks(savedMarks.length > 0 ? savedMarks : (cached.consolidationMarks || []));
           setSource("cache");
           setSourceTs(Date.now());
           setCachedAt(cached.cachedAt);
@@ -5957,8 +6348,22 @@ export default function PermissionExplorer() {
     return () => { cancelled = true; };
   }, []);
 
-  // Build indexes
-  const idx = useMemo(() => datasets ? buildIndexes(datasets) : null, [datasets]);
+  // BUG-22 v3.0.3: persist consolidationMarks to a separate IDB key whenever
+  // they change. Debounced to avoid thrashing IDB on rapid mark/unmark clicks.
+  const marksWriteTimer = useRef(null);
+  const marksInitialized = useRef(false);
+  useEffect(() => {
+    // Skip the initial render (marks are empty until hydrated from IDB above).
+    if (!marksInitialized.current) { marksInitialized.current = true; return; }
+    if (marksWriteTimer.current) clearTimeout(marksWriteTimer.current);
+    marksWriteTimer.current = setTimeout(() => {
+      idbWriteMarks(consolidationMarks);
+    }, 500);
+    return () => { if (marksWriteTimer.current) clearTimeout(marksWriteTimer.current); };
+  }, [consolidationMarks]);
+
+  // Build indexes — UX-63: builds from activeDatasets (simulated if active, else baseline).
+  const idx = useMemo(() => activeDatasets ? buildIndexes(activeDatasets) : null, [activeDatasets]);
 
   // Invalidate precomputes whenever datasets change (UX-14)
   useEffect(() => {
@@ -6046,6 +6451,7 @@ export default function PermissionExplorer() {
   }, [datasets, dismissals, consolidationMarks]);
 
   // ---- Bundle import handler ----
+  // UX-63 v3.1: recognizes simulation bundles and sets up simulation state.
   const onImportBundle = useCallback(async (file) => {
     try {
       const obj = await gunzipJSON(file);
@@ -6056,11 +6462,47 @@ export default function PermissionExplorer() {
       if (obj.version > 1) {
         setBanner({ tone: "yellow", text: `Bundle version ${obj.version} is newer than this app. Attempting best-effort load.` });
       }
-      const next = {};
-      for (const f of FILES) next[f.key] = (obj.datasets && obj.datasets[f.key] && obj.datasets[f.key].rows) || [];
       const nextDismissals = Array.isArray(obj.dismissals) ? obj.dismissals : [];
       const nextMarks = Array.isArray(obj.consolidationMarks) ? obj.consolidationMarks : [];
+
+      // UX-63: if this is a simulation bundle, load the baseline from _baseline
+      // and the simulated state from datasets.
+      if (obj.simulation && obj.simulation.isSimulation) {
+        const simDs = {};
+        for (const f of FILES) simDs[f.key] = (obj.datasets && obj.datasets[f.key] && obj.datasets[f.key].rows) || [];
+        // Restore baseline from _baseline slot if present; otherwise use simulated as baseline.
+        const baseDs = {};
+        if (obj._baseline) {
+          for (const f of FILES) baseDs[f.key] = (obj._baseline[f.key] && obj._baseline[f.key].rows) || [];
+        } else {
+          for (const f of FILES) baseDs[f.key] = simDs[f.key];
+        }
+        setDatasets(baseDs);
+        setSimulatedDatasets(simDs);
+        setSimulation({
+          name: obj.simulation.name || "Imported simulation",
+          type: "imported",
+          target: "",
+          createdAt: obj.simulation.simulationCreatedAt || new Date().toISOString(),
+          mutations: Array.isArray(obj.simulation.mutations) ? obj.simulation.mutations : [],
+        });
+        setSource("bundle");
+        setSourceTs(Date.now());
+        setCachedAt(null);
+        setUploadedAt({});
+        setDismissals(nextDismissals);
+        setConsolidationMarks(nextMarks);
+        setBanner({ tone: "accent", text: `Imported simulation: ${obj.simulation.name} — original baseline was ${obj.simulation.baselineCreatedAt || "unknown"}. Click "Reset to baseline" to switch to current data.` });
+        idbWriteCache({ datasets: baseDs, dismissals: nextDismissals, consolidationMarks: nextMarks });
+        return;
+      }
+
+      // Normal (non-simulation) bundle import.
+      const next = {};
+      for (const f of FILES) next[f.key] = (obj.datasets && obj.datasets[f.key] && obj.datasets[f.key].rows) || [];
       setDatasets(next);
+      setSimulatedDatasets(null); // clear any active simulation
+      setSimulation(null);
       setSource("bundle");
       setSourceTs(Date.now());
       setCachedAt(null);
@@ -6087,11 +6529,13 @@ export default function PermissionExplorer() {
       setDeleteCandidates(null);
       // BUG-17 v3.0.2: clear lifted Redundancy + Migration precomputes too.
       setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
+      // UX-63: clear simulation state.
+      setSimulatedDatasets(null); setSimulation(null);
       setDatasets(EMPTY_DATASETS);
       setSource("none");
       setSourceTs(Date.now());
       setCachedAt(null);
-      const ok = await idbClearCache();
+      const [ok] = await Promise.all([idbClearCache(), idbClearMarks()]); // BUG-22 v3.0.3
       setBanner({
         tone: ok ? "green" : "yellow",
         text: ok ? "Reset complete — cached data cleared. Upload CSVs or import a .pebundle to start." : "Reset complete (cache could not be cleared — IDB unavailable).",
@@ -6114,70 +6558,127 @@ export default function PermissionExplorer() {
     })();
   }, []);
 
-  // v2.6 UX-20 / BUG-17 v3.0.2: Load All Computations now precomputes all six
-  // expensive operations across Change Impact, Overlap & Redundancy, and Migration
-  // tabs. State is lifted to this parent component, so the tabs read precomputed
-  // values from props and skip their lazy first-visit useEffects when populated.
+  // ---- UX-63 v3.1: Simulation Mode callbacks ----
+  // Add a mutation to the current simulation, or start a new simulation.
+  const onSimulationMutate = useCallback((mutation) => {
+    if (!datasets) return;
+    const prevMutations = simulation ? simulation.mutations : [];
+    const nextMutations = [...prevMutations, mutation];
+    const nextSimulated = applyAllMutations(datasets, nextMutations);
+    setSimulatedDatasets(nextSimulated);
+    setSimulation(prev => ({
+      name: prev ? prev.name : "Untitled simulation",
+      type: mutation.type,
+      target: mutation.permSetId || mutation.userId || "",
+      createdAt: prev ? prev.createdAt : new Date().toISOString(),
+      mutations: nextMutations,
+    }));
+    // Invalidate precomputes so they rebuild from simulated data.
+    setImpactMatrix(null); setDeleteCandidates(null);
+    setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
+  }, [datasets, simulation]);
+
+  // Reset simulation back to baseline.
+  const onSimulationReset = useCallback(() => {
+    setSimulatedDatasets(null);
+    setSimulation(null);
+    // Invalidate precomputes so they rebuild from baseline data.
+    setImpactMatrix(null); setDeleteCandidates(null);
+    setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
+  }, []);
+
+  // Export simulation as a named .pebundle with simulation metadata.
+  const onExportSimulation = useCallback(async () => {
+    if (!simulatedDatasets || !simulation) return;
+    const name = prompt("Name this simulation:", simulation.name || "Untitled simulation");
+    if (name === null) return; // user cancelled
+    const payload = {
+      format: "pebundle",
+      version: 1,
+      createdAt: new Date().toISOString(),
+      sourceOrg: "",
+      appVersion: "2026-05-v3.1",
+      datasets: Object.fromEntries(FILES.map(f => [f.key, {
+        rows: simulatedDatasets[f.key] || [],
+        schema: (simulatedDatasets[f.key] && simulatedDatasets[f.key][0]) ? Object.keys(simulatedDatasets[f.key][0]) : [],
+      }])),
+      dismissals,
+      consolidationMarks,
+      simulation: {
+        isSimulation: true,
+        name: name || "Untitled simulation",
+        baselineCreatedAt: cachedAt || new Date().toISOString(),
+        simulationCreatedAt: new Date().toISOString(),
+        mutations: simulation.mutations,
+      },
+      // Also include the baseline datasets for round-trip.
+      _baseline: Object.fromEntries(FILES.map(f => [f.key, {
+        rows: (datasets && datasets[f.key]) || [],
+        schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
+      }])),
+    };
+    try {
+      const blob = await gzipJSON(payload);
+      const now = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      const fname = `permission-explorer_${slugify(name)}_${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.pebundle`;
+      downloadBlob(blob, fname);
+      setBanner({ tone: "green", text: `Simulation exported: ${fname} (${(blob.size / (1024*1024)).toFixed(1)} MB).` });
+    } catch (err) {
+      setBanner({ tone: "red", text: `Simulation export failed: ${err.message}` });
+    }
+  }, [simulatedDatasets, simulation, datasets, dismissals, consolidationMarks, cachedAt]);
+
+  // v2.6 UX-20 / BUG-17 v3.0.2 / BUG-20 v3.0.3: Load All Computations.
+  // v3.0.3: rewritten as async with structured yields between phases so banner
+  // state updates paint to the DOM (fixes T-35 banner visibility). Phase 4
+  // uses async chunked generator (fixes BUG-20 main-thread hang).
   const onLoadAllComputations = useCallback(() => {
     if (!idx || computing) return;
     setComputing(true);
     setComputingProgress("Starting…");
-    setTimeout(() => {
+    const yieldFrame = () => new Promise(r => setTimeout(r, 0));
+    (async () => {
       try {
         setComputingProgress("Phase 1/4 — Impact Matrix…");
+        await yieldFrame();
         const im = precomputeImpactMatrix(idx, (d, t) => {
           if ((d & 255) === 0) setComputingProgress(`Phase 1/4 — Impact Matrix (${d}/${t})`);
         });
         setImpactMatrix(im);
+
         setComputingProgress("Phase 2/4 — Delete candidates…");
-        // Run on next tick so the UI can paint between phases.
-        setTimeout(() => {
-          try {
-            const dc = precomputeDeleteCandidates(idx);
-            setDeleteCandidates(dc);
-            setComputingProgress("Phase 3/4 — Overlap & Redundancy…");
-            setTimeout(() => {
-              try {
-                const ov = precomputePermSetOverlap(idx);
-                setOverlap(ov);
-                const ov26 = precomputePermSetOverlapV26(idx);
-                setOverlapV26(ov26);
-                const orp = precomputeOrphans(idx);
-                setOrphans(orp);
-                const df = precomputeDeadFields(idx);
-                setDead(df);
-                setComputingProgress("Phase 4/4 — Migration similarity clusters…");
-                setTimeout(() => {
-                  try {
-                    const md = precomputeProfileSimilarity(idx);
-                    setMigrationData(md);
-                    setComputingProgress("");
-                    setComputing(false);
-                    setBanner({ tone: "green", text: `All computations complete — ${im.length.toLocaleString()} impact rows, ${dc.size.toLocaleString()} PermSets analyzed, ${ov.duplicates ? ov.duplicates.length : 0} duplicate clusters, ${orp.length} orphans, ${md.clusters.length} migration clusters.` });
-                  } catch (err) {
-                    setComputing(false);
-                    setComputingProgress("");
-                    setBanner({ tone: "red", text: `Computation failed in phase 4 (Migration): ${err.message}` });
-                  }
-                }, 30);
-              } catch (err) {
-                setComputing(false);
-                setComputingProgress("");
-                setBanner({ tone: "red", text: `Computation failed in phase 3 (Redundancy): ${err.message}` });
-              }
-            }, 30);
-          } catch (err) {
-            setComputing(false);
-            setComputingProgress("");
-            setBanner({ tone: "red", text: `Computation failed in phase 2: ${err.message}` });
-          }
-        }, 30);
+        await yieldFrame();
+        const dc = precomputeDeleteCandidates(idx);
+        setDeleteCandidates(dc);
+
+        setComputingProgress("Phase 3/4 — Overlap & Redundancy…");
+        await yieldFrame();
+        const ov = precomputePermSetOverlap(idx);
+        setOverlap(ov);
+        const ov26 = precomputePermSetOverlapV26(idx);
+        setOverlapV26(ov26);
+        const orp = precomputeOrphans(idx);
+        setOrphans(orp);
+        const df = precomputeDeadFields(idx);
+        setDead(df);
+
+        setComputingProgress("Phase 4/4 — Migration similarity clusters…");
+        await yieldFrame();
+        // BUG-20: use async chunked generator so profile clustering doesn't
+        // hang the main thread with Bullhorn's 68 profiles × 758 PermSets.
+        const md = await asyncChunked(() => precomputeProfileSimilarityGen(idx));
+        setMigrationData(md);
+
+        setComputingProgress("");
+        setComputing(false);
+        setBanner({ tone: "green", text: `All computations complete — ${im.length.toLocaleString()} impact rows, ${dc.size.toLocaleString()} PermSets analyzed, ${ov.duplicates ? ov.duplicates.length : 0} duplicate clusters, ${orp.length} orphans, ${md.clusters.length} migration clusters.` });
       } catch (err) {
         setComputing(false);
         setComputingProgress("");
-        setBanner({ tone: "red", text: `Computation failed in phase 1: ${err.message}` });
+        setBanner({ tone: "red", text: `Computation failed: ${err.message}` });
       }
-    }, 30);
+    })();
   }, [idx, computing]);
 
   // ---- Manifest recap data ----
@@ -6190,7 +6691,7 @@ export default function PermissionExplorer() {
   // ---- Tab list ----
   // v3.0: when no data is loaded, only Admin is reachable. The other tabs
   // depend on the index and would render empty / nonsensical content.
-  const hasData = datasetsHaveData(datasets);
+  const hasData = datasetsHaveData(activeDatasets);
   const allTabs = [
     { key: "explorer",   label: "Explorer" },
     { key: "impact",     label: "Change Impact" },
@@ -6245,6 +6746,16 @@ export default function PermissionExplorer() {
           {!source && <Pill tone="mute">No dataset</Pill>}
         </div>
 
+        {/* UX-63: Simulation mode banner — persistent (not auto-dismissed). */}
+        {isSimulating && simulation && (
+          <div style={{ padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: T.yellowBg, color: T.yellow, fontSize: 12, display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 600 }}>Simulating: {simulation.name}</span>
+            <Pill tone="yellow">{simulation.mutations.length} mutation{simulation.mutations.length !== 1 ? "s" : ""}</Pill>
+            <button className="pe-btn ghost" style={{ fontSize: 11, marginLeft: 4 }} onClick={onExportSimulation}>Save simulation</button>
+            <button className="pe-btn ghost" style={{ fontSize: 11, color: T.red }} onClick={onSimulationReset}>Reset to baseline</button>
+          </div>
+        )}
+
         {/* Transient banner */}
         {banner && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${T.border}`, background: banner.tone === "red" ? T.redBg : banner.tone === "green" ? T.greenBg : banner.tone === "yellow" ? T.yellowBg : T.accentBg, color: banner.tone === "red" ? T.red : banner.tone === "green" ? T.green : banner.tone === "yellow" ? T.yellow : T.accent, fontSize: 12 }}>
@@ -6267,7 +6778,8 @@ export default function PermissionExplorer() {
           </div>
         ) : (
           <>
-            {tab === "explorer" && <ExplorerTab idx={idx} selection={selection} setSelection={setSelection} />}
+            {tab === "explorer" && <ExplorerTab idx={idx} selection={selection} setSelection={setSelection}
+              isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} />}
             {tab === "impact" && <ChangeImpactTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }}
               impactMatrix={impactMatrix} setImpactMatrix={setImpactMatrix}
               deleteCandidates={deleteCandidates} setDeleteCandidates={setDeleteCandidates} />}
