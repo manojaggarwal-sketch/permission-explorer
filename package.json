@@ -1,6 +1,6 @@
 {
   "name": "permission-explorer",
-  "version": "3.5.1",
+  "version": "3.5.2",
   "private": true,
   "description": "Salesforce permission explorer — single-file React artifact. CSV-only data flow with IndexedDB pebundle cache.",
   "scripts": {},

@@ -1,7 +1,13 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.5.1
+  Version: 2026-05-v3.5.2
   Claude.ai artifact — single file, default export.
+
+  v3.5.2 — fix: nav version badge now derives from APP_VERSION (was hardcoded
+    "v3.1", stale since v3.1 through v3.5). Stronger autofill suppression: the
+    user typeahead is now type="search" (Safari ignores autocomplete="off" on
+    fields it reads as usernames but respects a search type) and the "Target
+    user" placeholder reworded from "Type a user name…" to "Start typing a name…".
 
   v3.5.1 — fix: suppress browser/OS credential autofill (Safari/iCloud Passwords
     "Enable Password AutoFill" key popup, 1Password, LastPass, Dashlane) on the
@@ -482,7 +488,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.5.1";
+const APP_VERSION = "2026-05-v3.5.2";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -1781,7 +1787,10 @@ function SuggestionTypeahead({ items, value, onSelect, getLabel, getId, getSub, 
   return (
     <div style={{ position: "relative" }}>
       <div style={{ position: "relative" }}>
-        <input className="pe-input" {...NO_AUTOFILL}
+        {/* v3.5.1: type="search" is a strong "not a credential field" signal —
+            Safari ignores autocomplete="off" on inputs it classifies as usernames,
+            but respects a search type. */}
+        <input className="pe-input" type="search" {...NO_AUTOFILL}
           value={q}
           placeholder={placeholder}
           onChange={e => { setQ(e.target.value); setActive(0); }}
@@ -4091,7 +4100,7 @@ function ScenarioC({ idx, nav }) {
             <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>User</div>
             {/* UX-28: SuggestionTypeahead applies on Enter/click instead of replacing the input —
                 matches the expectation of a suggestion picker (like Gmail's To: field). */}
-            <SuggestionTypeahead items={users} value={user} onSelect={setUser} getId={u => u.Id} getLabel={getUserLabel} getSub={getUserSub} placeholder="Type a user name…" />
+            <SuggestionTypeahead items={users} value={user} onSelect={setUser} getId={u => u.Id} getLabel={getUserLabel} getSub={getUserSub} placeholder="Start typing a name…" />
           </div>
           <div>
             <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>Future profile</div>
@@ -4724,7 +4733,7 @@ function PrescribeAccessTab({ idx, nav }) {
             <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>Target user</div>
             <SuggestionTypeahead items={users} value={prescribeUser} onSelect={setPrescribeUser}
               getId={u => u.Id} getLabel={getUserLabel} getSub={getUserSub}
-              placeholder="Type a user name…" />
+              placeholder="Start typing a name…" />
           </div>
           <div style={{ display: "flex", alignItems: "flex-end", gap: 6, flexWrap: "wrap" }}>
             <button className="pe-btn" style={{ fontSize: 12 }} onClick={() => addRow("object")}>+ Object</button>
@@ -7062,7 +7071,10 @@ export default function PermissionExplorer() {
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ width: 24, height: 24, borderRadius: 6, background: `linear-gradient(135deg, ${T.accent}, ${T.purple})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12 }}>P</div>
             <div style={{ fontWeight: 700 }}>Permission Explorer</div>
-            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>v3.1 · Salesforce</div>
+            {/* v3.5.2: derive from APP_VERSION so the nav badge can't drift (it
+                was hardcoded "v3.1" through v3.2–v3.5). Shows the trailing
+                vX.Y.Z portion of APP_VERSION (e.g. "2026-05-v3.5.2" → "v3.5.2"). */}
+            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>{(APP_VERSION.match(/v[\d.]+$/) || [APP_VERSION])[0]} · Salesforce</div>
           </div>
           <Tabs tabs={tabs} active={tab} onChange={setTab} />
           <div style={{ flex: 1 }} />
