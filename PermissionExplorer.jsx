@@ -1,7 +1,18 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.4
+  Version: 2026-05-v3.5
   Claude.ai artifact — single file, default export.
+
+  v3.5 — performance (table virtualization):
+    - New VirtualTable component (spacer-row technique, owns its scroll
+      container): fixed-height main rows + measured variable-height expandable
+      detail rows; tableLayout:fixed + colgroup keep columns stable; zebra
+      applied by data index (inline) since nth-child striping isn't stable under
+      virtualization.
+    - Applied to the Change-Impact (Scenario A) Impact Matrix table and the
+      Prescribe-Access Before/After debug table. Both lose their slice(0,2000)
+      cap — the full result set now scrolls with a constant DOM footprint. Text
+      columns ellipsize with a title tooltip.
 
   v3.4 — performance:
     - precomputeImpactMatrix is now a generator (precomputeImpactMatrixGen,
@@ -465,7 +476,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.4";
+const APP_VERSION = "2026-05-v3.5";
 
 const IDB_DB_NAME = "PermissionExplorer";
 const IDB_DB_VERSION = 1;
@@ -3308,6 +3319,91 @@ function VirtualList({ items, rowHeight, renderRow, getKey, style, overscan = 10
   );
 }
 
+// v3.5: table-row virtualizer. Owns the scroll container + table; renders only
+// the visible main rows (plus optional measured expandable detail rows) with
+// top/bottom spacer rows so the scroll height is correct. Requirements:
+//   - main rows are a FIXED `rowHeight` (caller sets height + ellipsis so rows
+//     can't grow past it — otherwise the offset math drifts);
+//   - `tableLayout: fixed` + a `colgroup` keep columns from re-sizing as rows
+//     scroll in and out;
+//   - expandable detail rows are variable height and measured on mount (only a
+//     handful are ever open, so the measure set stays tiny).
+function VirtualTable({
+  items, getKey, className, style, tableStyle, colgroup, head, colSpan,
+  rowHeight, isExpanded, renderRow, renderDetail, detailTdStyle,
+  maxHeight = 560, overscan = 8,
+}) {
+  const ref = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewport, setViewport] = useState(maxHeight);
+  const detailH = useRef(new Map());
+  const [, setTick] = useState(0);
+  const force = () => setTick(t => (t + 1) % 1000000);
+
+  useEffect(() => {
+    const el = ref.current; if (!el) return;
+    const u = () => setViewport(el.clientHeight || maxHeight);
+    u();
+    let ro; if (typeof ResizeObserver !== "undefined") { ro = new ResizeObserver(u); ro.observe(el); }
+    return () => { if (ro) ro.disconnect(); };
+  }, [maxHeight]);
+
+  const n = items.length;
+  const expandedH = it => (renderDetail && isExpanded && isExpanded(it)) ? (detailH.current.get(getKey(it)) ?? 240) : 0;
+
+  // Cumulative offsets (recomputed each render — O(n), fine for the few-thousand
+  // row cap; expansion/measurement changes are reflected immediately).
+  const offsets = new Array(n + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < n; i++) offsets[i + 1] = offsets[i] + rowHeight + expandedH(items[i]);
+  const totalH = offsets[n];
+
+  const bottom = scrollTop + viewport;
+  let start = 0;
+  while (start < n && offsets[start + 1] <= scrollTop) start++;
+  start = Math.max(0, start - overscan);
+  let end = start;
+  while (end < n && offsets[end] < bottom) end++;
+  end = Math.min(n, end + overscan);
+  const topPad = offsets[start];
+  const botPad = totalH - offsets[end];
+
+  const measure = (key, el) => {
+    if (!el) return;
+    const h = el.offsetHeight;
+    if (Math.abs((detailH.current.get(key) ?? -1) - h) > 1) { detailH.current.set(key, h); force(); }
+  };
+
+  return (
+    <div ref={ref} style={{ maxHeight, overflow: "auto", ...style }}
+         onScroll={e => setScrollTop(e.currentTarget.scrollTop)}>
+      <table className={className} style={{ width: "100%", tableLayout: "fixed", ...tableStyle }}>
+        {colgroup}
+        {head}
+        <tbody>
+          {topPad > 0 && <tr aria-hidden="true"><td colSpan={colSpan} style={{ height: topPad, padding: 0, border: 0 }} /></tr>}
+          {items.slice(start, end).map((it, k) => {
+            const i = start + k;
+            const key = getKey(it, i);
+            const open = renderDetail && isExpanded && isExpanded(it);
+            return (
+              <React.Fragment key={key}>
+                {renderRow(it, i)}
+                {open && (
+                  <tr ref={el => measure(key, el)}>
+                    <td colSpan={colSpan} style={detailTdStyle}>{renderDetail(it, i)}</td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
+          {botPad > 0 && <tr aria-hidden="true"><td colSpan={colSpan} style={{ height: botPad, padding: 0, border: 0 }} /></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationMutate }) {
   const [entry, setEntry] = useState(selection ? selection.kind : "User");
   useEffect(() => { if (selection && selection.kind !== entry) setEntry(selection.kind); /* keep in sync */ }, [selection]);
@@ -3586,10 +3682,29 @@ function ScenarioA({ idx, nav, impactMatrix, setImpactMatrix }) {
             {sorted.length.toLocaleString()} pairs · {sorted.filter(r => r.total === 0).length.toLocaleString()} zero-impact ·
             {" "}{sorted.filter(r => r.severity === "high").length.toLocaleString()} high-severity
           </div>
-          <div style={{ maxHeight: 560, overflow: "auto", border: `1px solid ${T.border}`, borderRadius: 8 }}>
-            <table className="pe-table">
+          {/* v3.5: virtualized — full result set scrolls (no 2000 cap), only
+              visible rows render. Fixed column layout keeps headers aligned as
+              rows scroll; row zebra is applied by data index (inline) since
+              nth-child striping isn't stable under virtualization. */}
+          <VirtualTable
+            items={sorted}
+            getKey={r => rowKey(r)}
+            className="pe-table"
+            style={{ border: `1px solid ${T.border}`, borderRadius: 8 }}
+            maxHeight={560}
+            rowHeight={42}
+            colSpan={11}
+            colgroup={
+              <colgroup>
+                <col style={{ width: 28 }} /><col /><col style={{ width: 150 }} /><col />
+                <col style={{ width: 120 }} /><col style={{ width: 90 }} /><col style={{ width: 78 }} />
+                <col style={{ width: 78 }} /><col style={{ width: 78 }} /><col style={{ width: 90 }} />
+                <col style={{ width: 110 }} />
+              </colgroup>
+            }
+            head={
               <thead><tr>
-                <th style={{ width: 24 }}></th>
+                <th></th>
                 <th>User</th><th>Profile</th><th>PermSet</th><th>Via Group</th>
                 <th>Severity</th><th>Lost Obj</th><th>Lost Fld</th><th>Lost Sys</th>
                 {/* BUG-13 v2.7: clickable Total header toggles DESC -> ASC -> unsorted. */}
@@ -3597,79 +3712,73 @@ function ScenarioA({ idx, nav, impactMatrix, setImpactMatrix }) {
                   title="Click to sort by Total — cycles DESC → ASC → unsorted">
                   Total{totalArrow}
                 </th>
-                <th style={{ width: 110 }}>Explorer</th>
+                <th>Explorer</th>
               </tr></thead>
-              <tbody>
-                {sorted.slice(0, 2000).map((r, i) => {
-                  const k = rowKey(r);
-                  const isOpen = expanded.has(k);
-                  return (
-                    <React.Fragment key={k}>
-                      <tr style={{ background: r.total === 0 ? T.greenBg : undefined, cursor: "pointer" }}
-                          onClick={() => toggleRow(k)}>
-                        <td style={{ color: T.textMuted }}>{isOpen ? "▾" : "▸"}</td>
-                        <td><span onClick={e => { e.stopPropagation(); const u = idx.userById.get(r.userId); if (u) nav({ kind: "User", item: u }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.userName}</span></td>
-                        <td style={{ color: T.textMuted }}>{r.profile}</td>
-                        <td><span onClick={e => { e.stopPropagation(); const ps = idx.permSetById.get(r.permSetId); if (ps) nav({ kind: "PermissionSet", item: ps }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.permSetLabel}</span></td>
-                        <td style={{ color: T.textMuted }}>{r.groupLabel || "—"}</td>
-                        <td>{sevPill(r.severity)}</td>
-                        <td>{r.lostObjects}</td><td>{r.lostFields}</td><td>{r.lostSys}</td>
-                        <td>{r.total === 0 ? <Pill tone="green">Zero</Pill> : <Pill tone="red">{r.total}</Pill>}</td>
-                        <td>
-                          {/* UX-29: cross-link — open this pair's user in the Explorer tab */}
-                          <button className="pe-btn ghost" style={{ fontSize: 11, padding: "2px 6px" }}
-                            onClick={e => { e.stopPropagation(); const u = idx.userById.get(r.userId); if (u) nav({ kind: "User", item: u }); }}>
-                            Open ↗
-                          </button>
-                        </td>
-                      </tr>
-                      {isOpen && (
-                        <tr>
-                          <td colSpan={11} style={{ background: T.bgAlt, padding: "8px 14px", fontSize: 12 }}>
-                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                              <div>
-                                <div style={{ fontWeight: 600, marginBottom: 4, color: T.red }}>
-                                  Lost tokens ({(r.lost || []).length})
-                                </div>
-                                {(r.lost || []).length === 0 ? <div style={{ color: T.textMuted }}>— none —</div> :
-                                  <div style={{ maxHeight: 180, overflow: "auto", fontFamily: T.mono, fontSize: 11 }}>
-                                    {(r.lost || []).slice(0, 200).map((l, j) => (
-                                      <div key={j} style={{ color: T.red, marginBottom: 2 }}>
-                                        {l.token}
-                                        <span style={{ color: T.textMuted, marginLeft: 6 }}>({l.label})</span>
-                                      </div>
-                                    ))}
-                                    {(r.lost || []).length > 200 && <div style={{ color: T.textMuted }}>…{r.lost.length - 200} more</div>}
-                                  </div>
-                                }
-                              </div>
-                              <div>
-                                <div style={{ fontWeight: 600, marginBottom: 4, color: T.green }}>
-                                  Covered tokens ({(r.covered || []).length})
-                                </div>
-                                {(r.covered || []).length === 0 ? <div style={{ color: T.textMuted }}>— none —</div> :
-                                  <div style={{ maxHeight: 180, overflow: "auto", fontFamily: T.mono, fontSize: 11 }}>
-                                    {(r.covered || []).slice(0, 200).map((c, j) => (
-                                      <div key={j} style={{ marginBottom: 2 }}>
-                                        <span style={{ color: T.textMuted }}>{c.token}</span>
-                                        <span style={{ marginLeft: 6 }}>({c.label}) ←{" "}</span>
-                                        <span style={{ color: T.accentLight }}>{(c.coveredBy || []).join(", ")}</span>
-                                      </div>
-                                    ))}
-                                    {(r.covered || []).length > 200 && <div style={{ color: T.textMuted }}>…{r.covered.length - 200} more</div>}
-                                  </div>
-                                }
-                              </div>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+            }
+            isExpanded={r => expanded.has(rowKey(r))}
+            detailTdStyle={{ background: T.bgAlt, padding: "8px 14px", fontSize: 12 }}
+            renderRow={(r, i) => {
+              const isOpen = expanded.has(rowKey(r));
+              const ell = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+              const zebra = r.total === 0 ? T.greenBg : (i % 2 ? "rgba(26,35,56,0.3)" : "transparent");
+              return (
+                <tr style={{ height: 42, background: zebra, cursor: "pointer" }} onClick={() => toggleRow(rowKey(r))}>
+                  <td style={{ color: T.textMuted }}>{isOpen ? "▾" : "▸"}</td>
+                  <td style={ell} title={r.userName}><span onClick={e => { e.stopPropagation(); const u = idx.userById.get(r.userId); if (u) nav({ kind: "User", item: u }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.userName}</span></td>
+                  <td style={{ color: T.textMuted, ...ell }} title={r.profile}>{r.profile}</td>
+                  <td style={ell} title={r.permSetLabel}><span onClick={e => { e.stopPropagation(); const ps = idx.permSetById.get(r.permSetId); if (ps) nav({ kind: "PermissionSet", item: ps }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.permSetLabel}</span></td>
+                  <td style={{ color: T.textMuted, ...ell }} title={r.groupLabel || ""}>{r.groupLabel || "—"}</td>
+                  <td>{sevPill(r.severity)}</td>
+                  <td>{r.lostObjects}</td><td>{r.lostFields}</td><td>{r.lostSys}</td>
+                  <td>{r.total === 0 ? <Pill tone="green">Zero</Pill> : <Pill tone="red">{r.total}</Pill>}</td>
+                  <td>
+                    {/* UX-29: cross-link — open this pair's user in the Explorer tab */}
+                    <button className="pe-btn ghost" style={{ fontSize: 11, padding: "2px 6px" }}
+                      onClick={e => { e.stopPropagation(); const u = idx.userById.get(r.userId); if (u) nav({ kind: "User", item: u }); }}>
+                      Open ↗
+                    </button>
+                  </td>
+                </tr>
+              );
+            }}
+            renderDetail={r => (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                <div>
+                  <div style={{ fontWeight: 600, marginBottom: 4, color: T.red }}>
+                    Lost tokens ({(r.lost || []).length})
+                  </div>
+                  {(r.lost || []).length === 0 ? <div style={{ color: T.textMuted }}>— none —</div> :
+                    <div style={{ maxHeight: 180, overflow: "auto", fontFamily: T.mono, fontSize: 11 }}>
+                      {(r.lost || []).slice(0, 200).map((l, j) => (
+                        <div key={j} style={{ color: T.red, marginBottom: 2 }}>
+                          {l.token}
+                          <span style={{ color: T.textMuted, marginLeft: 6 }}>({l.label})</span>
+                        </div>
+                      ))}
+                      {(r.lost || []).length > 200 && <div style={{ color: T.textMuted }}>…{r.lost.length - 200} more</div>}
+                    </div>
+                  }
+                </div>
+                <div>
+                  <div style={{ fontWeight: 600, marginBottom: 4, color: T.green }}>
+                    Covered tokens ({(r.covered || []).length})
+                  </div>
+                  {(r.covered || []).length === 0 ? <div style={{ color: T.textMuted }}>— none —</div> :
+                    <div style={{ maxHeight: 180, overflow: "auto", fontFamily: T.mono, fontSize: 11 }}>
+                      {(r.covered || []).slice(0, 200).map((c, j) => (
+                        <div key={j} style={{ marginBottom: 2 }}>
+                          <span style={{ color: T.textMuted }}>{c.token}</span>
+                          <span style={{ marginLeft: 6 }}>({c.label}) ←{" "}</span>
+                          <span style={{ color: T.accentLight }}>{(c.coveredBy || []).join(", ")}</span>
+                        </div>
+                      ))}
+                      {(r.covered || []).length > 200 && <div style={{ color: T.textMuted }}>…{r.covered.length - 200} more</div>}
+                    </div>
+                  }
+                </div>
+              </div>
+            )}
+          />
           <div style={{ marginTop: 8 }}>
             <ExportCSVButton rows={sorted} columns={["userName","email","profile","permSetLabel","groupLabel","severity","lostObjects","lostFields","lostSys","total"]} filename="impact_matrix.csv" />
           </div>
@@ -4133,42 +4242,49 @@ function ChangeProfileDebugPanel({ show, onToggle, objRows, fldRows, sysRows }) 
                 onClick={() => setWhich(opt.k)}>{opt.label}</button>
             ))}
           </div>
-          <div style={{ marginTop: 10, maxHeight: 320, overflow: "auto", border: `1px solid ${T.border}`, borderRadius: 8 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: T.mono }}>
-              <thead>
-                <tr style={{ position: "sticky", top: 0, background: T.bgAlt, zIndex: 1 }}>
-                  <th style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>Scope</th>
-                  <th style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>Key</th>
-                  <th style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>Before</th>
-                  <th style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>After</th>
-                  <th style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>Classification</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.slice(0, 2000).map((r, i) => (
-                  <tr key={i} style={{ borderBottom: `1px solid ${T.border}` }}>
-                    <td style={{ padding: "3px 8px", color: T.textMuted }}>{r.scope}</td>
-                    <td style={{ padding: "3px 8px", color: T.accentLight }}>{r.key}</td>
-                    <td style={{ padding: "3px 8px" }}>{r.before ? "true" : "false"}</td>
-                    <td style={{ padding: "3px 8px" }}>{r.after ? "true" : "false"}</td>
-                    <td style={{ padding: "3px 8px" }}>
-                      {r.cls === "Lost" && <Pill tone="red">Lost</Pill>}
-                      {r.cls === "Gained" && <Pill tone="green">Gained</Pill>}
-                      {r.cls === "Unchanged" && <Pill tone="mute">Unchanged</Pill>}
-                    </td>
+          {/* v3.5: virtualized — full filtered set scrolls (no 2000 cap). Uniform
+              rows, no expansion. Fixed layout + ellipsis keep columns stable. */}
+          {!filtered.length ? (
+            <div style={{ marginTop: 10, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 8px", color: T.textMuted, textAlign: "center", fontSize: 11 }}>No rows.</div>
+          ) : (
+            <VirtualTable
+              items={filtered}
+              getKey={(r, i) => i}
+              style={{ marginTop: 10, border: `1px solid ${T.border}`, borderRadius: 8 }}
+              tableStyle={{ borderCollapse: "collapse", fontSize: 11, fontFamily: T.mono }}
+              maxHeight={320}
+              rowHeight={24}
+              colSpan={5}
+              colgroup={
+                <colgroup>
+                  <col style={{ width: "16%" }} /><col style={{ width: "44%" }} />
+                  <col style={{ width: "12%" }} /><col style={{ width: "12%" }} /><col style={{ width: "16%" }} />
+                </colgroup>
+              }
+              head={
+                <thead>
+                  <tr style={{ position: "sticky", top: 0, background: T.bgAlt, zIndex: 1 }}>
+                    {["Scope", "Key", "Before", "After", "Classification"].map(h => (
+                      <th key={h} style={{ textAlign: "left", padding: "4px 8px", borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>{h}</th>
+                    ))}
                   </tr>
-                ))}
-                {filtered.length > 2000 && (
-                  <tr><td colSpan={5} style={{ padding: "6px 8px", color: T.textMuted, textAlign: "center" }}>
-                    Truncated to first 2,000 rows of {filtered.length} to keep the panel responsive.
-                  </td></tr>
-                )}
-                {!filtered.length && (
-                  <tr><td colSpan={5} style={{ padding: "10px 8px", color: T.textMuted, textAlign: "center" }}>No rows.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+              }
+              renderRow={r => (
+                <tr style={{ height: 24, borderBottom: `1px solid ${T.border}` }}>
+                  <td style={{ padding: "3px 8px", color: T.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.scope}>{r.scope}</td>
+                  <td style={{ padding: "3px 8px", color: T.accentLight, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.key}>{r.key}</td>
+                  <td style={{ padding: "3px 8px" }}>{r.before ? "true" : "false"}</td>
+                  <td style={{ padding: "3px 8px" }}>{r.after ? "true" : "false"}</td>
+                  <td style={{ padding: "3px 8px" }}>
+                    {r.cls === "Lost" && <Pill tone="red">Lost</Pill>}
+                    {r.cls === "Gained" && <Pill tone="green">Gained</Pill>}
+                    {r.cls === "Unchanged" && <Pill tone="mute">Unchanged</Pill>}
+                  </td>
+                </tr>
+              )}
+            />
+          )}
         </>
       )}
     </div>
