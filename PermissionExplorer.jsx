@@ -1,7 +1,14 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.1
+  Version: 2026-05-v3.2
   Claude.ai artifact — single file, default export.
+
+  v3.2 adds:
+    - UX-64: Interactive paired-diff explorer. PairedDiffPane now renders the
+      Has/Missing/Shared/Differs legend as toggle filter buttons, an AND/OR
+      "combine" mode toggle, and a session-only "Running list" sidebar for
+      collecting the specific permission rows to work on. Lands on every paired
+      diff across the app (Mergable tab, Duplicate tab, Compare/Reconcile panes).
 
   v3.1 adds:
     - UX-57: IsManaged flag derived from NamespacePrefix on every PermSet.
@@ -500,7 +507,7 @@ async function idbWriteCache({ datasets, dismissals, consolidationMarks }) {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.1",
+      appVersion: "2026-05-v3.2",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: (datasets && datasets[f.key]) || [],
         schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -4882,31 +4889,161 @@ function PairedDiffLegend({ style }) {
 // UI renders: for the A column, `Has: <label>` if inA, `Missing: <label>` if !inA;
 // symmetrically for B. When both inA && inB the row is `Shared: <label>` on both
 // sides. This replaces every "only in X" label across the app.
+//
+// v3.2 (UX-64): PairedDiffPane is now an interactive filter + running-list
+// explorer. The legend doubles as toggle buttons (Has / Missing / Shared /
+// Differs); an AND/OR mode toggle controls how multiple selected filters
+// combine; and a session-only "Running list" on the right lets the analyst
+// collect the specific permission rows they intend to work on. Because every
+// paired diff across the app renders through this one component, the capability
+// lands on all of them at once.
+
+// Derive the category badge from the token prefix (O:/F:/S:).
+function tokenCategory(tok) {
+  if (!tok) return "Other";
+  if (tok.startsWith("O:")) return "Object";
+  if (tok.startsWith("F:")) return "Field";
+  if (tok.startsWith("S:")) return "System";
+  return "Other";
+}
+
+// Status set a row carries relative to the pair.
+//   both sides         → ["Shared"]
+//   exclusive to a side → ["Has","Missing"]  (Has on the owning side, Missing on the other)
+// "Differs" is kept in the legend for parity with the token model but isn't
+// produced today (each CRUD bit is its own token), so it simply matches nothing.
+function rowStatusSet(r) {
+  if (r.inA && r.inB) return ["Shared"];
+  return ["Has", "Missing"];
+}
+
 function PairedDiffPane({ aLabel, bLabel, tokens }) {
+  const [filters, setFilters] = useState({ Has: false, Missing: false, Shared: false, Differs: false });
+  const [mode, setMode] = useState("OR"); // "OR" | "AND"
+  const [runningList, setRunningList] = useState([]); // session-only [{ token, label, category }]
+
+  const legend = pairedDiffLegend();
+  const active = Object.keys(filters).filter(k => filters[k]);
+
+  const filtered = useMemo(() => {
+    if (active.length === 0) return tokens;
+    return tokens.filter(r => {
+      const st = rowStatusSet(r);
+      return mode === "AND" ? active.every(f => st.includes(f)) : active.some(f => st.includes(f));
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokens, filters, mode]);
+
+  const toggle = k => setFilters(p => ({ ...p, [k]: !p[k] }));
+  const clearFilters = () => setFilters({ Has: false, Missing: false, Shared: false, Differs: false });
+  const addToList = r => setRunningList(p => (p.find(x => x.token === r.token) ? p : [...p, { token: r.token, label: r.label, category: tokenCategory(r.token) }]));
+  const removeFromList = token => setRunningList(p => p.filter(x => x.token !== token));
+  const inList = token => runningList.some(x => x.token === token);
+
+  const toneMap = { Has: "green", Missing: "red", Shared: "mute", Differs: "yellow" };
+
+  const renderRow = (r, i, side) => {
+    let tone, term, color;
+    if (r.inA && r.inB) { tone = "mute"; term = "Shared"; color = T.accentLight; }
+    else if ((side === "A" && r.inA) || (side === "B" && r.inB)) { tone = "green"; term = "Has"; color = T.accentLight; }
+    else { tone = "red"; term = "Missing"; color = T.textMuted; }
+    const added = inList(r.token);
+    return (
+      <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+        <Pill tone={tone}>{term}</Pill>
+        <span style={{ color, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</span>
+        <button
+          title={added ? "In running list" : "Add to running list"}
+          onClick={() => addToList(r)}
+          style={{ background: "transparent", border: 0, cursor: "pointer", color: added ? T.green : T.textMuted, fontWeight: 700, fontSize: 13, lineHeight: 1, padding: "0 4px" }}
+        >{added ? "✓" : "+"}</button>
+      </div>
+    );
+  };
+
+  const pane = (label, side) => (
+    <div>
+      <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>{label}</div>
+      <div style={{ maxHeight: 260, overflow: "auto", fontFamily: T.mono, fontSize: 11, border: `1px solid ${T.border}`, borderRadius: 8, padding: 8 }}>
+        {filtered.length === 0 && <div style={{ color: T.textMuted }}>— nothing —</div>}
+        {filtered.map((r, i) => renderRow(r, i, side))}
+      </div>
+    </div>
+  );
+
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-        <div>
-          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>{aLabel}</div>
-          <div style={{ maxHeight: 260, overflow: "auto", fontFamily: T.mono, fontSize: 11, border: `1px solid ${T.border}`, borderRadius: 8, padding: 8 }}>
-            {tokens.length === 0 && <div style={{ color: T.textMuted }}>— nothing —</div>}
-            {tokens.map((r, i) => {
-              if (r.inA && r.inB) return <div key={i} style={{ marginBottom: 2 }}><Pill tone="mute">Shared</Pill> <span style={{ color: T.accentLight }}>{r.label}</span></div>;
-              if (r.inA)          return <div key={i} style={{ marginBottom: 2 }}><Pill tone="green">Has</Pill> <span style={{ color: T.accentLight }}>{r.label}</span></div>;
-                                  return <div key={i} style={{ marginBottom: 2 }}><Pill tone="red">Missing</Pill> <span style={{ color: T.textMuted }}>{r.label}</span></div>;
-            })}
-          </div>
+      {/* Interactive legend / filter toolbar */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, padding: "6px 0", fontSize: 11 }}>
+        <span style={{ color: T.textMuted, fontWeight: 600 }}>Filter:</span>
+        {legend.map(x => {
+          const on = filters[x.term];
+          const [c] = (function () { return [({ green: T.green, red: T.red, yellow: T.yellow, mute: T.textMuted })[toneMap[x.term]] || T.accent]; })();
+          return (
+            <button
+              key={x.term}
+              onClick={() => toggle(x.term)}
+              title={x.desc}
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                padding: "3px 10px", borderRadius: 999, cursor: "pointer", fontFamily: "inherit", fontSize: 11, fontWeight: 600,
+                color: on ? "#fff" : c, background: on ? c : "transparent",
+                border: `1px solid ${c}`, boxShadow: on ? `0 0 0 2px ${T.bg}, 0 0 0 3px ${c}` : "none",
+              }}
+            >{x.term}</button>
+          );
+        })}
+        <div style={{ width: 1, alignSelf: "stretch", background: T.border, margin: "0 2px" }} />
+        {/* AND / OR mode toggle */}
+        <span style={{ color: T.textMuted }}>Combine:</span>
+        <div style={{ display: "inline-flex", border: `1px solid ${T.border}`, borderRadius: 999, overflow: "hidden" }}>
+          {["OR", "AND"].map(m => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              style={{
+                padding: "3px 12px", border: 0, cursor: "pointer", fontFamily: "inherit", fontSize: 11, fontWeight: 700,
+                color: mode === m ? "#fff" : T.textMuted, background: mode === m ? T.accent : "transparent",
+              }}
+            >{m}</button>
+          ))}
         </div>
-        <div>
-          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>{bLabel}</div>
-          <div style={{ maxHeight: 260, overflow: "auto", fontFamily: T.mono, fontSize: 11, border: `1px solid ${T.border}`, borderRadius: 8, padding: 8 }}>
-            {tokens.length === 0 && <div style={{ color: T.textMuted }}>— nothing —</div>}
-            {tokens.map((r, i) => {
-              if (r.inA && r.inB) return <div key={i} style={{ marginBottom: 2 }}><Pill tone="mute">Shared</Pill> <span style={{ color: T.accentLight }}>{r.label}</span></div>;
-              if (r.inB)          return <div key={i} style={{ marginBottom: 2 }}><Pill tone="green">Has</Pill> <span style={{ color: T.accentLight }}>{r.label}</span></div>;
-                                  return <div key={i} style={{ marginBottom: 2 }}><Pill tone="red">Missing</Pill> <span style={{ color: T.textMuted }}>{r.label}</span></div>;
-            })}
+        {active.length > 0 && (
+          <>
+            <span style={{ color: T.textMuted }}>· {filtered.length} of {tokens.length}</span>
+            <button className="pe-btn ghost" style={{ fontSize: 11, padding: "2px 6px" }} onClick={clearFilters}>clear</button>
+          </>
+        )}
+      </div>
+
+      {/* Diff panes + running list */}
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+        <div style={{ flex: 3, minWidth: 0, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          {pane(aLabel, "A")}
+          {pane(bLabel, "B")}
+        </div>
+        <div style={{ flex: 1, minWidth: 170 }}>
+          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
+            Running list
+            {runningList.length > 0 && <Pill tone="accent">{runningList.length}</Pill>}
           </div>
+          <div style={{ maxHeight: 260, overflow: "auto", fontFamily: T.mono, fontSize: 11, border: `1px solid ${T.border}`, borderRadius: 8, padding: 8 }}>
+            {runningList.length === 0 && <div style={{ color: T.textMuted }}>Click + on a row to track it here.</div>}
+            {runningList.map(item => (
+              <div key={item.token} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                <Pill tone="mute" style={{ fontSize: 9 }}>{item.category}</Pill>
+                <span style={{ color: T.accentLight, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.label}</span>
+                <button
+                  title="Remove"
+                  onClick={() => removeFromList(item.token)}
+                  style={{ background: "transparent", border: 0, cursor: "pointer", color: T.textMuted, fontWeight: 700, fontSize: 13, lineHeight: 1, padding: "0 4px" }}
+                >×</button>
+              </div>
+            ))}
+          </div>
+          {runningList.length > 0 && (
+            <button className="pe-btn ghost" style={{ fontSize: 11, padding: "2px 6px", marginTop: 4 }} onClick={() => setRunningList([])}>clear list</button>
+          )}
         </div>
       </div>
     </div>
@@ -5170,7 +5307,6 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
                   <div style={{ flex: 1 }} />
                   <button className="pe-btn ghost" onClick={() => setCompareOverlapPair(null)}>Close</button>
                 </div>
-                <PairedDiffLegend />
                 <PairedDiffPane aLabel={aLabel} bLabel={bLabel} tokens={rows} />
               </div>
             );
@@ -5657,8 +5793,7 @@ function ConsolidatePairPane({ idx, aId, bId }) {
         ))}
       </div>
       {/* Token diff */}
-      <PairedDiffLegend style={{ marginBottom: 6 }} />
-      <div style={{ maxHeight: 420, overflowY: "auto" }}>
+      <div style={{ maxHeight: 460, overflowY: "auto" }}>
         <PairedDiffPane aLabel={aLabel} bLabel={bLabel} tokens={tokens} />
       </div>
     </div>
@@ -6430,7 +6565,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.1",
+      appVersion: "2026-05-v3.2",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: datasets[f.key] || [],
         schema: (datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -6597,7 +6732,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.1",
+      appVersion: "2026-05-v3.2",
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: simulatedDatasets[f.key] || [],
         schema: (simulatedDatasets[f.key] && simulatedDatasets[f.key][0]) ? Object.keys(simulatedDatasets[f.key][0]) : [],
