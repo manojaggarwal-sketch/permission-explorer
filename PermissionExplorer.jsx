@@ -1,7 +1,19 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.2
+  Version: 2026-05-v3.3
   Claude.ai artifact — single file, default export.
+
+  v3.3 — internal refactor (no behavior change):
+    - Collapsed the duplicated sync precompute* functions (profile similarity,
+      PermSet overlap, overlap-V26) to delegate to their async generators via
+      drainGen() — single source of truth for the O(n²) clustering logic.
+    - subsetExtras() reuses signatures cached on overlap.entries (sigMap) instead
+      of recomputing grantorSignature twice per subset pair.
+    - Lazy setTimeout precomputes (Redundancy, Mergable, Duplicate tabs) now have
+      cancellation guards so a tab switch / idx change can't write stale results.
+    - Added setIsSubset() short-circuit helper; overlap-V26 loop computes the
+      intersection in one pass instead of three array spreads.
+    - Centralized the app version into a single APP_VERSION constant.
 
   v3.2 adds:
     - UX-64: Interactive paired-diff explorer. PairedDiffPane now renders the
@@ -440,6 +452,11 @@ function datasetsHaveData(d) {
  * helpers — IDB is best-effort, every method resolves to either a value or
  * null, and the caller falls back to "no cache."
  * --------------------------------------------------------------------------*/
+// v3.3: single source of truth for the app version. Stamped into every exported
+// pebundle's `appVersion` field. Keep in sync with the header comment,
+// package.json, and index.html on each release.
+const APP_VERSION = "2026-05-v3.3";
+
 const IDB_DB_NAME = "PermissionExplorer";
 const IDB_DB_VERSION = 1;
 const IDB_STORE = "cache";
@@ -507,7 +524,7 @@ async function idbWriteCache({ datasets, dismissals, consolidationMarks }) {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.2",
+      appVersion: APP_VERSION,
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: (datasets && datasets[f.key]) || [],
         schema: (datasets && datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -639,6 +656,24 @@ function asyncChunked(workFn) {
   });
 }
 
+// v3.3: Run a generator-based computation to completion synchronously. Lets the
+// sync precompute* wrappers share a single implementation with their async
+// generator counterparts (no more duplicated O(n²) loop bodies to keep in sync).
+function drainGen(gen) {
+  let r = gen.next();
+  while (!r.done) r = gen.next();
+  return r.value;
+}
+
+// v3.3: Short-circuiting subset test over two Sets. Replaces the
+// `[...a].every(x => b.has(x))` idiom — no array allocation, returns on the
+// first miss instead of always walking the whole set.
+function setIsSubset(a, b) {
+  if (a.size > b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
 // BUG-20 v3.0.3: Async version of precomputeProfileSimilarity.
 // Uses a generator that yields after processing each profile's row of the
 // pairwise comparison matrix, keeping the main thread unblocked.
@@ -688,8 +723,8 @@ function* precomputePermSetOverlapGen(idx) {
     for (let j = i + 1; j < entries.length; j++) {
       const a = entries[i], b = entries[j];
       if (a.sig.size === 0 || b.sig.size === 0) continue;
-      const aInB = [...a.sig].every(x => b.sig.has(x));
-      const bInA = [...b.sig].every(x => a.sig.has(x));
+      const aInB = setIsSubset(a.sig, b.sig);
+      const bInA = setIsSubset(b.sig, a.sig);
       if (aInB && bInA) dups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label });
       else if (aInB) subsets.push({ subsetId: a.id, subsetLabel: a.label, supersetId: b.id, supersetLabel: b.label });
       else if (bInA) subsets.push({ subsetId: b.id, subsetLabel: b.label, supersetId: a.id, supersetLabel: a.label });
@@ -708,9 +743,10 @@ function* precomputePermSetOverlapV26Gen(idx) {
     for (let j = i + 1; j < entries.length; j++) {
       const a = entries[i], b = entries[j];
       if (a.sig.size === 0 || b.sig.size === 0) continue;
-      const aInB = [...a.sig].every(x => b.sig.has(x));
-      const bInA = [...b.sig].every(x => a.sig.has(x));
-      const inter = [...a.sig].filter(x => b.sig.has(x)).length;
+      let inter = 0;
+      for (const x of a.sig) if (b.sig.has(x)) inter++;
+      const aInB = inter === a.sig.size;
+      const bInA = inter === b.sig.size;
       const uni = a.sig.size + b.sig.size - inter;
       const score = uni === 0 ? 0 : inter / uni;
       if (aInB && bInA) {
@@ -1338,36 +1374,10 @@ function precomputeDeleteCandidates(idx) {
 }
 
 // Profile similarity clustering (6.4) — Jaccard > 0.7 pairs and transitive clusters.
+// v3.3: sync wrapper now drains the generator (single source of truth — the
+// pairwise/clustering logic lives only in precomputeProfileSimilarityGen).
 function precomputeProfileSimilarity(idx) {
-  const profs = [...idx.profileById.values()];
-  const sigs = profs.map(p => ({ id: p.Id, name: p.Name, sig: grantorSignature(idx, p.Id) }));
-  const pairs = [];
-  const adj = new Map();
-  for (let i = 0; i < sigs.length; i++)
-    for (let j = i + 1; j < sigs.length; j++) {
-      const s = jaccard(sigs[i].sig, sigs[j].sig);
-      if (s >= 0.7) {
-        pairs.push({ a: sigs[i].id, aName: sigs[i].name, b: sigs[j].id, bName: sigs[j].name, score: s });
-        if (!adj.has(sigs[i].id)) adj.set(sigs[i].id, new Set());
-        if (!adj.has(sigs[j].id)) adj.set(sigs[j].id, new Set());
-        adj.get(sigs[i].id).add(sigs[j].id); adj.get(sigs[j].id).add(sigs[i].id);
-      }
-    }
-  // Build connected components
-  const seen = new Set();
-  const clusters = [];
-  for (const n of adj.keys()) {
-    if (seen.has(n)) continue;
-    const stack = [n]; const cluster = [];
-    while (stack.length) {
-      const x = stack.pop();
-      if (seen.has(x)) continue;
-      seen.add(x); cluster.push(x);
-      for (const y of adj.get(x) || []) if (!seen.has(y)) stack.push(y);
-    }
-    if (cluster.length > 1) clusters.push(cluster.map(id => ({ id, name: idx.profileById.get(id).Name })));
-  }
-  return { pairs, clusters, sigs };
+  return drainGen(precomputeProfileSimilarityGen(idx));
 }
 
 // Three-way decomposition for the profiles in a cluster.
@@ -1392,23 +1402,9 @@ function threeWayDecomposition(sigsForCluster) {
 }
 
 // Duplicate + subset detection across PermSets.
+// v3.3: sync wrapper drains precomputePermSetOverlapGen (single source of truth).
 function precomputePermSetOverlap(idx) {
-  const entries = [];
-  for (const ps of idx.permSetById.values())
-    entries.push({ id: ps.Id, label: ps.Label, sig: grantorSignature(idx, ps.Id) });
-  const dups = [];
-  const subsets = [];
-  for (let i = 0; i < entries.length; i++)
-    for (let j = i + 1; j < entries.length; j++) {
-      const a = entries[i], b = entries[j];
-      if (a.sig.size === 0 || b.sig.size === 0) continue;
-      const aInB = [...a.sig].every(x => b.sig.has(x));
-      const bInA = [...b.sig].every(x => a.sig.has(x));
-      if (aInB && bInA) dups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label });
-      else if (aInB) subsets.push({ subsetId: a.id, subsetLabel: a.label, supersetId: b.id, supersetLabel: b.label });
-      else if (bInA) subsets.push({ subsetId: b.id, subsetLabel: b.label, supersetId: a.id, supersetLabel: a.label });
-    }
-  return { dups, subsets, entries };
+  return drainGen(precomputePermSetOverlapGen(idx));
 }
 
 // Orphaned PermSets (no user + not in any group).
@@ -1467,34 +1463,9 @@ function tokenToNoun(tok) {
 
 // v2.6 UX-40: Near-duplicate detection — Jaccard ≥ 0.85 but not exact.
 // Returns { dups, nearDups, subsets } with the entries pre-sorted by score.
+// v3.3: sync wrapper drains precomputePermSetOverlapV26Gen (single source of truth).
 function precomputePermSetOverlapV26(idx) {
-  const entries = [];
-  for (const ps of idx.permSetById.values())
-    entries.push({ id: ps.Id, label: ps.Label, sig: grantorSignature(idx, ps.Id) });
-  const dups = [], nearDups = [], subsets = [];
-  for (let i = 0; i < entries.length; i++)
-    for (let j = i + 1; j < entries.length; j++) {
-      const a = entries[i], b = entries[j];
-      if (a.sig.size === 0 || b.sig.size === 0) continue;
-      const aInB = [...a.sig].every(x => b.sig.has(x));
-      const bInA = [...b.sig].every(x => a.sig.has(x));
-      const inter = [...a.sig].filter(x => b.sig.has(x)).length;
-      const uni = a.sig.size + b.sig.size - inter;
-      const score = uni === 0 ? 0 : inter / uni;
-      if (aInB && bInA) {
-        dups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label, score: 1, sharedCount: a.sig.size });
-      } else if (aInB) {
-        subsets.push({ subsetId: a.id, subsetLabel: a.label, supersetId: b.id, supersetLabel: b.label });
-      } else if (bInA) {
-        subsets.push({ subsetId: b.id, subsetLabel: b.label, supersetId: a.id, supersetLabel: a.label });
-      } else if (score >= 0.85) {
-        const aOnly = [...a.sig].filter(x => !b.sig.has(x));
-        const bOnly = [...b.sig].filter(x => !a.sig.has(x));
-        nearDups.push({ a: a.id, aLabel: a.label, b: b.id, bLabel: b.label, score, aOnly, bOnly, shared: inter });
-      }
-    }
-  nearDups.sort((x, y) => y.score - x.score);
-  return { dups, nearDups, subsets, entries };
+  return drainGen(precomputePermSetOverlapV26Gen(idx));
 }
 
 // v2.6 UX-43: pairwise Jaccard matrix for a cluster of profiles/permsets.
@@ -4827,9 +4798,12 @@ function classifyToken(tok) {
 // UX-51 v2.7: compute extras for (A ⊂ B) subset relationship, grouped by category.
 // Objects track each CRUD bit separately so the admin sees C/R/E/D/VA/MA granularly.
 // Setup-entity extras come from `idx.setupByParent` and are grouped by SetupEntityType.
-function subsetExtras(idx, subsetId, supersetId) {
-  const sigA = grantorSignature(idx, subsetId);
-  const sigB = grantorSignature(idx, supersetId);
+// v3.3: optional `sigMap` (id → signature Set) lets callers reuse the signatures
+// already computed by precomputePermSetOverlap*(idx).entries, skipping two
+// grantorSignature() walks per subset pair. Falls back to computing on demand.
+function subsetExtras(idx, subsetId, supersetId, sigMap) {
+  const sigA = (sigMap && sigMap.get(subsetId)) || grantorSignature(idx, subsetId);
+  const sigB = (sigMap && sigMap.get(supersetId)) || grantorSignature(idx, supersetId);
   const extras = [...sigB].filter(t => !sigA.has(t));
   const grouped = { objects: [], fields: [], system: [], setup: [] };
   for (const t of extras) grouped[classifyToken(t)].push(t);
@@ -5088,10 +5062,17 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
   useEffect(() => {
     // Only kick off lazy computes for slots that aren't already populated
     // (BUG-17 v3.0.2 — Load All Computations may have already filled them).
-    if (overlap == null) setTimeout(() => setOverlap(precomputePermSetOverlap(idx)), 20);
-    if (overlapV26 == null) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 25);
-    if (orphans == null) setTimeout(() => setOrphans(precomputeOrphans(idx)), 30);
-    if (dead == null) setTimeout(() => setDead(precomputeDeadFields(idx)), 40);
+    // v3.3: guard against stale writes — if idx changes or the tab unmounts
+    // before a deferred compute fires, the cleanup flips `cancelled` so the
+    // setState is skipped (no overwriting fresh data with stale results).
+    let cancelled = false;
+    const timers = [];
+    const lazy = (cond, fn, setter, ms) => { if (cond) timers.push(setTimeout(() => { if (!cancelled) setter(fn(idx)); }, ms)); };
+    lazy(overlap == null, precomputePermSetOverlap, setOverlap, 20);
+    lazy(overlapV26 == null, precomputePermSetOverlapV26, setOverlapV26, 25);
+    lazy(orphans == null, precomputeOrphans, setOrphans, 30);
+    lazy(dead == null, precomputeDeadFields, setDead, 40);
+    return () => { cancelled = true; timers.forEach(clearTimeout); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx]);
 
@@ -5108,9 +5089,12 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
   // twice per subset pair, and was recomputed inline on every render.
   const { reallySubsets, reclassifiedAsDup, allDups } = useMemo(() => {
     if (!overlap) return { reallySubsets: [], reclassifiedAsDup: [], allDups: [] };
+    // v3.3: reuse the signatures cached on overlap.entries instead of recomputing
+    // them twice per subset pair inside subsetExtras.
+    const sigMap = new Map((overlap.entries || []).map(e => [e.id, e.sig]));
     const subsetsAnnotated = (overlap.subsets || []).map(s => ({
       ...s,
-      extras: subsetExtras(idx, s.subsetId, s.supersetId),
+      extras: subsetExtras(idx, s.subsetId, s.supersetId, sigMap),
     }));
     const rs = subsetsAnnotated.filter(s => s.extras.total > 0);
     const rd = subsetsAnnotated.filter(s => s.extras.total === 0).map(s => ({
@@ -5807,7 +5791,10 @@ function ConsolidatePairPane({ idx, aId, bId }) {
 function MergablePermSetsTab({ idx, overlapV26, setOverlapV26, consolidationMarks, setConsolidationMarks, nav }) {
   // Lazy-trigger overlap computation if this tab is visited before RedundancyTab.
   useEffect(() => {
-    if (overlapV26 == null && idx) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 10);
+    if (!(overlapV26 == null && idx)) return;
+    let cancelled = false; // v3.3: skip stale write if idx changes / tab unmounts
+    const t = setTimeout(() => { if (!cancelled) setOverlapV26(precomputePermSetOverlapV26(idx)); }, 10);
+    return () => { cancelled = true; clearTimeout(t); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx]);
   const [includeManaged, setIncludeManaged] = useState(false);
@@ -5974,7 +5961,10 @@ function MergablePermSetsTab({ idx, overlapV26, setOverlapV26, consolidationMark
 function DuplicatePermSetsTab({ idx, overlapV26, setOverlapV26, consolidationMarks, setConsolidationMarks, nav }) {
   // Lazy-trigger overlap computation if this tab is visited before RedundancyTab.
   useEffect(() => {
-    if (overlapV26 == null && idx) setTimeout(() => setOverlapV26(precomputePermSetOverlapV26(idx)), 10);
+    if (!(overlapV26 == null && idx)) return;
+    let cancelled = false; // v3.3: skip stale write if idx changes / tab unmounts
+    const t = setTimeout(() => { if (!cancelled) setOverlapV26(precomputePermSetOverlapV26(idx)); }, 10);
+    return () => { cancelled = true; clearTimeout(t); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx]);
   const [includeManaged, setIncludeManaged] = useState(false);
@@ -6565,7 +6555,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.2",
+      appVersion: APP_VERSION,
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: datasets[f.key] || [],
         schema: (datasets[f.key] && datasets[f.key][0]) ? Object.keys(datasets[f.key][0]) : [],
@@ -6732,7 +6722,7 @@ export default function PermissionExplorer() {
       version: 1,
       createdAt: new Date().toISOString(),
       sourceOrg: "",
-      appVersion: "2026-05-v3.2",
+      appVersion: APP_VERSION,
       datasets: Object.fromEntries(FILES.map(f => [f.key, {
         rows: simulatedDatasets[f.key] || [],
         schema: (simulatedDatasets[f.key] && simulatedDatasets[f.key][0]) ? Object.keys(simulatedDatasets[f.key][0]) : [],
