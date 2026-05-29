@@ -1,7 +1,13 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.5
+  Version: 2026-05-v3.5.1
   Claude.ai artifact — single file, default export.
+
+  v3.5.1 — fix: suppress browser/OS credential autofill (Safari/iCloud Passwords
+    "Enable Password AutoFill" key popup, 1Password, LastPass, Dashlane) on the
+    free-text search/typeahead inputs via a shared NO_AUTOFILL attribute bundle.
+    The Prescribe-Access "Target user" field's "user name" placeholder was being
+    misread as a login username.
 
   v3.5 — performance (table virtualization):
     - New VirtualTable component (spacer-row technique, owns its scroll
@@ -476,7 +482,23 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.5";
+const APP_VERSION = "2026-05-v3.5.1";
+
+// v3.5: spread onto free-text inputs to stop browser/OS credential autofill
+// (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
+// LastPass, Dashlane) from treating search/typeahead boxes as login fields.
+// Safari keys off placeholders like "user name", so plain autoComplete="off"
+// isn't enough on its own — the password-manager data-* hints matter too.
+const NO_AUTOFILL = {
+  autoComplete: "off",
+  autoCorrect: "off",
+  autoCapitalize: "off",
+  spellCheck: false,
+  name: "pe-field-no-autofill",
+  "data-lpignore": "true",
+  "data-1p-ignore": "true",
+  "data-form-type": "other",
+};
 
 const IDB_DB_NAME = "PermissionExplorer";
 const IDB_DB_VERSION = 1;
@@ -1613,7 +1635,7 @@ function StatCard({ label, value, tone = "accent" }) {
 function SearchInput({ value, onChange, placeholder, style }) {
   return (
     <div style={{ position: "relative", ...style }}>
-      <input className="pe-input" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder || "Search…"} style={{ width: "100%", paddingLeft: 30 }} />
+      <input className="pe-input" {...NO_AUTOFILL} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder || "Search…"} style={{ width: "100%", paddingLeft: 30 }} />
       <span style={{ position: "absolute", left: 10, top: 8, color: T.textDim }}>⌕</span>
     </div>
   );
@@ -1682,7 +1704,7 @@ function Typeahead({ items, value, onSelect, getLabel, getId, getSub, placeholde
 
   return (
     <div ref={ref} style={{ position: "relative" }}>
-      <input className="pe-input"
+      <input className="pe-input" {...NO_AUTOFILL}
         value={q}
         placeholder={placeholder}
         onChange={e => { setQ(e.target.value); setOpen(true); }}
@@ -1759,7 +1781,7 @@ function SuggestionTypeahead({ items, value, onSelect, getLabel, getId, getSub, 
   return (
     <div style={{ position: "relative" }}>
       <div style={{ position: "relative" }}>
-        <input className="pe-input"
+        <input className="pe-input" {...NO_AUTOFILL}
           value={q}
           placeholder={placeholder}
           onChange={e => { setQ(e.target.value); setActive(0); }}
@@ -1913,7 +1935,7 @@ function GroupedFieldsByObject({ fieldRows, idx }) {
           Effective Fields — <span style={{ color: T.textMuted }}>{fieldRows.length.toLocaleString()} rows / {byObj.size} objects</span>
         </div>
         <div style={{ flex: 1 }} />
-        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Filter by object…"
+        <input {...NO_AUTOFILL} value={q} onChange={e => setQ(e.target.value)} placeholder="Filter by object…"
           style={{ background: T.bgAlt, border: `1px solid ${T.border}`, color: T.text, borderRadius: 6, padding: "4px 8px", fontSize: 12, width: 200 }} />
       </div>
       {fieldRows.length === 0 ? (
@@ -2753,7 +2775,7 @@ function SimulateAddPermSetButton({ idx, user, onSimulationMutate }) {
   return (
     <div style={{ marginBottom: 12, padding: "8px 0", borderBottom: `1px solid ${T.border}` }}>
       <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 6 }}>Simulate adding PermSet to {user.Name}:</div>
-      <input type="text" placeholder="Search permission sets…" value={q} onChange={e => setQ(e.target.value)}
+      <input type="text" {...NO_AUTOFILL} placeholder="Search permission sets…" value={q} onChange={e => setQ(e.target.value)}
         style={{ width: "100%", maxWidth: 400, padding: "6px 10px", fontSize: 12, border: `1px solid ${T.border}`, borderRadius: 6, background: T.bgAlt, color: T.text, marginBottom: 4 }}
         autoFocus />
       <div style={{ maxHeight: 200, overflow: "auto", border: `1px solid ${T.border}`, borderRadius: 6, background: T.card }}>
