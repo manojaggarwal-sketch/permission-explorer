@@ -1,7 +1,17 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.5.2
+  Version: 2026-05-v3.6
   Claude.ai artifact — single file, default export.
+
+  v3.6 — feature: Compare Users (UX-65). New tab that diffs two users'
+    EFFECTIVE permissions side by side: assignment-source diff (which profile /
+    permission sets each has that the other lacks) + a token-level diff of
+    objects, fields, CRUD, and system permissions via PairedDiffPane (filters +
+    running list). Built on userEffectiveSignature() so results reconcile with
+    Change Impact. Cross-links both ways (Explorer user → Compare; Compare →
+    Change Impact). "Make A match B → simulate ↗" pushes B's missing PermSets
+    into Simulation Mode (new onSimulationMutateMany batch) and jumps to Change
+    Impact to show the blast radius. CSV export of the full diff.
 
   v3.5.2 — fix: nav version badge now derives from APP_VERSION (was hardcoded
     "v3.1", stale since v3.1 through v3.5). Stronger autofill suppression: the
@@ -488,7 +498,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.5.2";
+const APP_VERSION = "2026-05-v3.6";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -1229,6 +1239,45 @@ function effectiveSysPerms(idx, userId) {
     }
   }
   return out;
+}
+
+// v3.6 (UX-65): a user's EFFECTIVE permission signature as a token Set, in the
+// same token vocabulary as grantorSignature / the impact matrix (O:obj:flag,
+// F:field:R|E, S:perm). Built from the resolved effective* maps so it already
+// accounts for profile fan-out, group membership, and muting permsets — i.e.
+// the diff reconciles exactly with Change Impact.
+function userEffectiveSignature(idx, userId) {
+  const sig = new Set();
+  for (const [sobj, e] of effectiveObjects(idx, userId)) {
+    if (e.c)  sig.add(`O:${sobj}:C`);
+    if (e.r)  sig.add(`O:${sobj}:R`);
+    if (e.e)  sig.add(`O:${sobj}:E`);
+    if (e.d)  sig.add(`O:${sobj}:D`);
+    if (e.va) sig.add(`O:${sobj}:VA`);
+    if (e.ma) sig.add(`O:${sobj}:MA`);
+  }
+  for (const [field, e] of effectiveFields(idx, userId).grant) {
+    if (e.read) sig.add(`F:${field}:R`);
+    if (e.edit) sig.add(`F:${field}:E`);
+  }
+  for (const k of Object.keys(effectiveSysPerms(idx, userId))) sig.add(`S:${k}`);
+  return sig;
+}
+
+// v3.6 (UX-65): diff two users' assignment sources (profile + PermSets/groups).
+// Returns { shared, onlyA, onlyB } of { id, label, kind, groupLabel }. Profiles
+// are included (kind "profile") so the comparison shows a differing base profile.
+function diffUserSources(idx, aId, bId) {
+  const key = s => `${s.kind === "profile" ? "profile" : "ps"}:${s.id}`;
+  const aSrc = userSources(idx, aId);
+  const bSrc = userSources(idx, bId);
+  const aMap = new Map(aSrc.map(s => [key(s), s]));
+  const bMap = new Map(bSrc.map(s => [key(s), s]));
+  const shared = [], onlyA = [], onlyB = [];
+  for (const [k, s] of aMap) (bMap.has(k) ? shared : onlyA).push(s);
+  for (const [k, s] of bMap) if (!aMap.has(k)) onlyB.push(s);
+  const byLabel = (x, y) => (x.label || "").localeCompare(y.label || "");
+  return { shared: shared.sort(byLabel), onlyA: onlyA.sort(byLabel), onlyB: onlyB.sort(byLabel) };
 }
 
 /* ============================================================================
@@ -2817,7 +2866,7 @@ function SimulateAddPermSetButton({ idx, user, onSimulationMutate }) {
   );
 }
 
-function UserDetail({ idx, user, nav, isSimulating, onSimulationMutate }) {
+function UserDetail({ idx, user, nav, isSimulating, onSimulationMutate, goTab }) {
   const sources = userSources(idx, user.Id);
   const effObjects = effectiveObjects(idx, user.Id);
   const { grant: effFields, mute: muteFields } = effectiveFields(idx, user.Id);
@@ -2826,7 +2875,8 @@ function UserDetail({ idx, user, nav, isSimulating, onSimulationMutate }) {
   const role = idx.roleById.get(user.UserRoleId);
   // UX-23: toggle to hide objects where every CRUD/VA/MA flag is false (muted or never granted).
   // BUG-12 v2.7: cascadeObject / setCascadeObject drive the Object -> Field cascade.
-  const { hideZeroGrantObjects, setHideZeroGrantObjects, cascadeObject, setCascadeObject } = useAppState();
+  const { hideZeroGrantObjects, setHideZeroGrantObjects, cascadeObject, setCascadeObject,
+          setCompareUserA, setCompareUserB } = useAppState();
 
   const sourceTag = s => {
     if (s.kind === "profile") return `Profile: ${s.label}`;
@@ -2874,6 +2924,16 @@ function UserDetail({ idx, user, nav, isSimulating, onSimulationMutate }) {
         { label: "Effective fields", value: fieldRows.length, tone: "accent" },
         { label: "Muted fields", value: mutedRows.length, tone: "red" },
       ]} />
+
+      {/* UX-65 v3.6: cross-link into Compare Users with this user preloaded. */}
+      {goTab && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button className="pe-btn secondary" style={{ fontSize: 11 }}
+            onClick={() => { setCompareUserA(user); goTab("compare"); }}>Compare as User A ↗</button>
+          <button className="pe-btn ghost" style={{ fontSize: 11 }}
+            onClick={() => { setCompareUserB(user); goTab("compare"); }}>Compare as User B ↗</button>
+        </div>
+      )}
 
       {/* UX-63 v3.1: Simulation action — add PermSet to this user */}
       {onSimulationMutate && (
@@ -3435,7 +3495,7 @@ function VirtualTable({
   );
 }
 
-function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationMutate }) {
+function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationMutate, goTab }) {
   const [entry, setEntry] = useState(selection ? selection.kind : "User");
   useEffect(() => { if (selection && selection.kind !== entry) setEntry(selection.kind); /* keep in sync */ }, [selection]);
   const [q, setQ] = useState("");
@@ -3555,7 +3615,7 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
 
       <div style={{ overflow: "auto", padding: 24 }}>
         {!selection ? <Empty text={`Pick ${entry === "User" || entry === "Object" || entry === "Field" ? "a " : "a "}${entry} to begin.`} /> : (
-          selection.kind === "User" ? <UserDetail idx={idx} user={selection.item} nav={setSelection} isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} /> :
+          selection.kind === "User" ? <UserDetail idx={idx} user={selection.item} nav={setSelection} isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} goTab={goTab} /> :
           selection.kind === "Profile" ? <ProfileDetail idx={idx} profile={selection.item} nav={setSelection} /> :
           selection.kind === "PermissionSet" ? <PermSetDetail idx={idx} permSet={selection.item} nav={setSelection} isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} /> :
           selection.kind === "PermissionSetGroup" ? <GroupDetail idx={idx} group={selection.item} nav={setSelection} /> :
@@ -6466,6 +6526,167 @@ function slugify(str) {
     .slice(0, 60) || "simulation";
 }
 
+// ============================================================================
+// UX-65 v3.6 — Compare Users tab. Side-by-side effective-permission diff of two
+// users: which PermSets/profile differ, and which object/field/CRUD/system
+// tokens each has that the other doesn't. Reuses PairedDiffPane (filters +
+// running list) for the token diff. Cross-links into Change Impact, and a
+// "Make A match B" action that pushes the missing PermSets into Simulation Mode
+// and jumps to Change Impact to show the blast radius.
+// ============================================================================
+function CompareUsersTab({ idx, nav, goTab, onSimulationMutateMany }) {
+  const {
+    compareUserA: A, setCompareUserA: setA,
+    compareUserB: B, setCompareUserB: setB,
+    compareOnlyDiff: onlyDiff, setCompareOnlyDiff: setOnlyDiff,
+    setImpactFilterUser, setImpactFilterPs, setImpactScenario,
+  } = useAppState();
+
+  const users = useMemo(() => [...idx.userById.values()], [idx]);
+
+  const cmp = useMemo(() => {
+    if (!A || !B || A.Id === B.Id) return null;
+    const sigA = userEffectiveSignature(idx, A.Id);
+    const sigB = userEffectiveSignature(idx, B.Id);
+    const all = [...new Set([...sigA, ...sigB])].sort();
+    const tokens = all.map(t => ({ token: t, label: tokenToNoun(t), inA: sigA.has(t), inB: sigB.has(t) }));
+    let shared = 0, onlyA = 0, onlyB = 0;
+    for (const r of tokens) { if (r.inA && r.inB) shared++; else if (r.inA) onlyA++; else onlyB++; }
+    const uni = sigA.size + sigB.size - shared;
+    const jac = uni === 0 ? 1 : shared / uni;
+    return { sigA, sigB, tokens, shared, onlyA, onlyB, jac, srcDiff: diffUserSources(idx, A.Id, B.Id) };
+  }, [idx, A, B]);
+
+  const aLabel = A ? (A.Name || A.Id) : "User A";
+  const bLabel = B ? (B.Name || B.Id) : "User B";
+
+  const visibleTokens = useMemo(() => {
+    if (!cmp) return [];
+    return onlyDiff ? cmp.tokens.filter(r => r.inA !== r.inB) : cmp.tokens;
+  }, [cmp, onlyDiff]);
+
+  const tokensInCat = cat => visibleTokens.filter(r => tokenCategory(r.token) === cat);
+
+  const openInImpact = u => { setImpactScenario("A"); setImpactFilterPs(""); setImpactFilterUser(u.Name || ""); goTab("impact"); };
+
+  // "Make `target` match `source`" — assign target the PermSets source has that
+  // target lacks (profiles can't be assigned via PSA, so they're skipped), then
+  // jump to Change Impact to show the blast radius of those grants.
+  const makeMatch = (target, source) => {
+    const d = diffUserSources(idx, target.Id, source.Id); // d.onlyB = source has, target lacks
+    const muts = d.onlyB.filter(s => s.kind !== "profile").map(s => ({
+      type: "addPSA", permSetId: s.id, permSetLabel: s.label,
+      userId: target.Id, userName: target.Name, userProfileId: target.ProfileId,
+    }));
+    if (!muts.length) return;
+    onSimulationMutateMany(muts, `Make ${target.Name} match ${source.Name}`);
+    goTab("impact");
+  };
+
+  const csvRows = useMemo(() => (cmp ? cmp.tokens.map(r => ({
+    category: tokenCategory(r.token), token: r.token, label: r.label,
+    [aLabel]: r.inA ? "yes" : "no", [bLabel]: r.inB ? "yes" : "no",
+    status: r.inA && r.inB ? "Shared" : r.inA ? `Only ${aLabel}` : `Only ${bLabel}`,
+  })) : []), [cmp, aLabel, bLabel]);
+
+  const SourceList = ({ title, tone, list }) => (
+    <div style={{ background: T.bgAlt, borderRadius: 8, padding: 10 }}>
+      <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 6 }}>{title} <Pill tone={tone}>{list.length}</Pill></div>
+      {list.length === 0 ? <div style={{ color: T.textMuted, fontSize: 11 }}>— none —</div> : (
+        <div style={{ maxHeight: 160, overflow: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
+          {list.map(s => (
+            <div key={s.kind + s.id} style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 6 }}>
+              <Pill tone={s.kind === "profile" ? "purple" : s.kind === "muting" ? "orange" : "mute"}>{s.kind === "profile" ? "Profile" : s.kind === "muting" ? "Muting" : "PermSet"}</Pill>
+              <span style={{ color: T.accentLight, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.label}>{s.label}</span>
+              {s.groupLabel && <span style={{ color: T.textMuted }}>· via {s.groupLabel}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={{ padding: 20 }}>
+      <HeaderBlock title="Compare Users" subtitle="Side-by-side effective-permission diff — which permission sets, objects, fields, CRUD, and system permissions differ between two users." />
+
+      {/* Pickers */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 40px 1fr", gap: 10, alignItems: "end", marginTop: 12 }}>
+        <div>
+          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>User A</div>
+          <SuggestionTypeahead items={users} value={A} onSelect={setA} getId={u => u.Id} getLabel={getUserLabel} getSub={getUserSub} placeholder="Start typing a name…" />
+        </div>
+        <button className="pe-btn secondary" title="Swap A and B" style={{ height: 34 }}
+          onClick={() => { const t = A; setA(B); setB(t); }}>⇄</button>
+        <div>
+          <div style={{ fontSize: 11, color: T.textMuted, marginBottom: 4 }}>User B</div>
+          <SuggestionTypeahead items={users} value={B} onSelect={setB} getId={u => u.Id} getLabel={getUserLabel} getSub={getUserSub} placeholder="Start typing a name…" />
+        </div>
+      </div>
+
+      {A && B && A.Id === B.Id && <div style={{ marginTop: 14, color: T.yellow, fontSize: 12 }}>Pick two different users to compare.</div>}
+      {(!A || !B) && <div style={{ marginTop: 14, color: T.textMuted, fontSize: 12 }}>Select a user on each side to see the difference.</div>}
+
+      {cmp && (
+        <>
+          {/* Summary */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 16 }}>
+            <Pill tone="accent">Jaccard {(cmp.jac * 100).toFixed(1)}%</Pill>
+            <Pill tone="mute">{cmp.shared} shared</Pill>
+            <Pill tone="green">{cmp.onlyA} only {aLabel}</Pill>
+            <Pill tone="green">{cmp.onlyB} only {bLabel}</Pill>
+            <div style={{ flex: 1 }} />
+            <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => openInImpact(A)}>Open {aLabel} in Change Impact ↗</button>
+            <button className="pe-btn ghost" style={{ fontSize: 11 }} onClick={() => openInImpact(B)}>Open {bLabel} in Change Impact ↗</button>
+          </div>
+
+          {/* PermSet / source diff */}
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Assignment sources (profile + permission sets)</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+              <SourceList title={`Only ${aLabel} has`} tone="green" list={cmp.srcDiff.onlyA} />
+              <SourceList title="Shared" tone="mute" list={cmp.srcDiff.shared} />
+              <SourceList title={`Only ${bLabel} has`} tone="green" list={cmp.srcDiff.onlyB} />
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button className="pe-btn secondary" style={{ fontSize: 11 }} disabled={cmp.srcDiff.onlyB.filter(s => s.kind !== "profile").length === 0}
+                onClick={() => makeMatch(A, B)} title="Simulate giving A the PermSets B has, then open Change Impact">
+                Make {aLabel} match {bLabel} → simulate ↗
+              </button>
+              <button className="pe-btn secondary" style={{ fontSize: 11 }} disabled={cmp.srcDiff.onlyA.filter(s => s.kind !== "profile").length === 0}
+                onClick={() => makeMatch(B, A)} title="Simulate giving B the PermSets A has, then open Change Impact">
+                Make {bLabel} match {aLabel} → simulate ↗
+              </button>
+            </div>
+          </div>
+
+          {/* Token diff */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 18, marginBottom: 4 }}>
+            <div style={{ fontWeight: 600 }}>Effective permission diff</div>
+            <label style={{ fontSize: 12, color: T.textMuted, display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={onlyDiff} onChange={e => setOnlyDiff(e.target.checked)} />
+              Only show differences
+            </label>
+            <div style={{ flex: 1 }} />
+            <ExportCSVButton rows={csvRows} columns={["category", "token", "label", aLabel, bLabel, "status"]} filename="user_compare.csv" />
+          </div>
+          {[{ cat: "Object", label: "Objects" }, { cat: "Field", label: "Fields" }, { cat: "System", label: "System permissions" }].map(({ cat, label }) => {
+            const rows = tokensInCat(cat);
+            return (
+              <div key={cat} style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: T.textMuted, marginBottom: 4 }}>{label} <Pill tone="mute">{rows.length}</Pill></div>
+                {rows.length === 0
+                  ? <div style={{ color: T.textMuted, fontSize: 11 }}>{onlyDiff ? "No differences." : "— none —"}</div>
+                  : <PairedDiffPane aLabel={aLabel} bLabel={bLabel} tokens={rows} />}
+              </div>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
 const AppStateContext = createContext(null);
 function useAppState() {
   const ctx = useContext(AppStateContext);
@@ -6530,6 +6751,12 @@ function AppStateProvider({ children }) {
   const [mergableConsumer, setMergableConsumer] = useState(null);     // superset PS id
   const [duplicateCluster, setDuplicateCluster] = useState(null);     // cluster index
 
+  // UX-65 v3.6: Compare Users tab — the two selected users (User rows) persist
+  // across tab switches and can be preloaded by cross-links from other tabs.
+  const [compareUserA, setCompareUserA] = useState(null);
+  const [compareUserB, setCompareUserB] = useState(null);
+  const [compareOnlyDiff, setCompareOnlyDiff] = useState(true);
+
   const resetAll = useCallback(() => {
     setExplorerSelection(null); setExplorerSearch("");
     setImpactFilterUser(""); setImpactFilterPs(""); setImpactFilterProfile("");
@@ -6548,6 +6775,7 @@ function AppStateProvider({ children }) {
     // v3.1 resets
     setConsolidationMarks([]);
     setMergableConsumer(null); setDuplicateCluster(null);
+    setCompareUserA(null); setCompareUserB(null); setCompareOnlyDiff(true); // UX-65 v3.6
   }, []);
 
   const value = {
@@ -6584,6 +6812,9 @@ function AppStateProvider({ children }) {
     consolidationMarks, setConsolidationMarks,          // UX-58/59
     mergableConsumer, setMergableConsumer,              // UX-58
     duplicateCluster, setDuplicateCluster,              // UX-59
+    compareUserA, setCompareUserA,                      // UX-65 v3.6
+    compareUserB, setCompareUserB,                      // UX-65 v3.6
+    compareOnlyDiff, setCompareOnlyDiff,                // UX-65 v3.6
     resetAll,
   };
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
@@ -6914,6 +7145,25 @@ export default function PermissionExplorer() {
     setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
   }, [datasets, simulation]);
 
+  // UX-65 v3.6: apply MANY mutations at once (e.g. "Make A match B" assigns
+  // several PermSets in one go). onSimulationMutate reads `simulation` from
+  // closure, so calling it in a loop would drop all but the last — this batches.
+  const onSimulationMutateMany = useCallback((mutations, name) => {
+    if (!datasets || !mutations || !mutations.length) return;
+    const prevMutations = simulation ? simulation.mutations : [];
+    const nextMutations = [...prevMutations, ...mutations];
+    setSimulatedDatasets(applyAllMutations(datasets, nextMutations));
+    setSimulation(prev => ({
+      name: prev ? prev.name : (name || "Untitled simulation"),
+      type: "batch",
+      target: "",
+      createdAt: prev ? prev.createdAt : new Date().toISOString(),
+      mutations: nextMutations,
+    }));
+    setImpactMatrix(null); setDeleteCandidates(null);
+    setOverlap(null); setOverlapV26(null); setOrphans(null); setDead(null); setMigrationData(null);
+  }, [datasets, simulation]);
+
   // Reset simulation back to baseline.
   const onSimulationReset = useCallback(() => {
     setSimulatedDatasets(null);
@@ -7032,6 +7282,7 @@ export default function PermissionExplorer() {
   const allTabs = [
     { key: "explorer",   label: "Explorer" },
     { key: "impact",     label: "Change Impact" },
+    { key: "compare",    label: "Compare Users" },        // UX-65 v3.6
     { key: "prescribe",  label: "Prescribe Access" },
     { key: "redundancy", label: "Overlap & Redundancy" },
     { key: "mergable",   label: "Mergable PermSets" },   // UX-58 v3.1
@@ -7119,10 +7370,14 @@ export default function PermissionExplorer() {
         ) : (
           <>
             {tab === "explorer" && <ExplorerTab idx={idx} selection={selection} setSelection={setSelection}
-              isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} />}
+              isSimulating={isSimulating} onSimulationMutate={onSimulationMutate} goTab={setTab} />}
             {tab === "impact" && <ChangeImpactTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }}
               impactMatrix={impactMatrix} setImpactMatrix={setImpactMatrix}
               deleteCandidates={deleteCandidates} setDeleteCandidates={setDeleteCandidates} />}
+            {tab === "compare" && <CompareUsersTab idx={idx}
+              nav={s => { setSelection(s); setTab("explorer"); }}
+              goTab={setTab}
+              onSimulationMutateMany={onSimulationMutateMany} />}
             {tab === "prescribe" && <PrescribeAccessTab idx={idx} nav={s => { setSelection(s); setTab("explorer"); }} />}
             {tab === "redundancy" && <RedundancyTab idx={idx} dismissals={dismissals} setDismissals={setDismissals}
               overlap={overlap} setOverlap={setOverlap}
