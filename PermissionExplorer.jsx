@@ -1,7 +1,17 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.3
+  Version: 2026-05-v3.4
   Claude.ai artifact — single file, default export.
+
+  v3.4 — performance:
+    - precomputeImpactMatrix is now a generator (precomputeImpactMatrixGen,
+      yields every 50 users); ScenarioA and the Load-All Phase 1 run it via
+      asyncChunked() so the UI/progress bar stay responsive instead of freezing
+      5–15s on a large org. ScenarioA also gained a cancellation guard. Sync
+      precomputeImpactMatrix() retained as a drainGen() wrapper.
+    - New VirtualList component: the ExplorerTab item picker is windowed (only
+      visible rows render), removing the 2000-item cap and keeping a small
+      constant DOM footprint for multi-thousand-field lists.
 
   v3.3 — internal refactor (no behavior change):
     - Collapsed the duplicated sync precompute* functions (profile similarity,
@@ -455,7 +465,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.3";
+const APP_VERSION = "2026-05-v3.4";
 
 const IDB_DB_NAME = "PermissionExplorer";
 const IDB_DB_VERSION = 1;
@@ -1223,12 +1233,18 @@ function jaccard(a, b) {
 // v2.6 UX-30/31: also returns lost[] and covered[] token lists per row plus a severity
 // bucket ("none" | "low" | "medium" | "high") so the UI can expand rows and badge them.
 // Returns rows: {userId, userName, profile, permSetId, permSetLabel, lostObjects, lostFields, lostSystem, total, lost, covered, severity}
-function precomputeImpactMatrix(idx, onProgress) {
+// v3.4: generator form so callers can run it via asyncChunked() and keep the UI
+// responsive on large orgs (this loop is O(users × assignments × effective-perm
+// walks) and used to block the main thread for 5–15s). Yields every 50 users.
+// The sync wrapper precomputeImpactMatrix() below drains it for non-async callers.
+function* precomputeImpactMatrixGen(idx, onProgress) {
   const rows = [];
   const users = [...idx.userById.values()];
   const totalPairs = [...idx.psaByUser.values()].reduce((n, arr) => n + arr.filter(a => !a.IsOwnedByProfile).length, 0);
   let done = 0;
+  let uIdx = 0;
   for (const u of users) {
+    if ((uIdx++ % 50) === 49) yield; // keep the main thread responsive
     const assigns = (idx.psaByUser.get(u.Id) || []).filter(a => !a.IsOwnedByProfile);
     if (!assigns.length) continue;
 
@@ -1324,6 +1340,11 @@ function precomputeImpactMatrix(idx, onProgress) {
   }
   if (onProgress) onProgress(totalPairs, totalPairs);
   return rows;
+}
+
+// v3.4: sync wrapper — drains the generator for callers that don't need chunking.
+function precomputeImpactMatrix(idx, onProgress) {
+  return drainGen(precomputeImpactMatrixGen(idx, onProgress));
 }
 
 // UX-15 Zero-impact deletion candidates.
@@ -3252,6 +3273,41 @@ const ENTRY_POINTS = [
   { key: "CustomPermission", label: "Custom Permissions", icon: "✦", tone: "orange" },
 ];
 
+// v3.4: lightweight fixed-height windowed list. Owns its scroll container and
+// renders only the visible rows (+ overscan) so a list of thousands of items
+// keeps a small constant DOM footprint. Rows MUST be exactly `rowHeight` tall.
+function VirtualList({ items, rowHeight, renderRow, getKey, style, overscan = 10 }) {
+  const ref = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewport, setViewport] = useState(600);
+  useEffect(() => {
+    const el = ref.current; if (!el) return;
+    const update = () => setViewport(el.clientHeight || 600);
+    update();
+    let ro;
+    if (typeof ResizeObserver !== "undefined") { ro = new ResizeObserver(update); ro.observe(el); }
+    return () => { if (ro) ro.disconnect(); };
+  }, []);
+  const total = items.length;
+  const start = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visible = Math.ceil(viewport / rowHeight) + overscan * 2;
+  const end = Math.min(total, start + visible);
+  const slice = items.slice(start, end);
+  return (
+    <div ref={ref} style={{ overflow: "auto", ...style }} onScroll={e => setScrollTop(e.currentTarget.scrollTop)}>
+      <div style={{ height: total * rowHeight, position: "relative" }}>
+        <div style={{ position: "absolute", top: start * rowHeight, left: 0, right: 0 }}>
+          {slice.map((it, i) => (
+            <div key={getKey(it)} style={{ height: rowHeight, boxSizing: "border-box", overflow: "hidden" }}>
+              {renderRow(it, start + i)}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationMutate }) {
   const [entry, setEntry] = useState(selection ? selection.kind : "User");
   useEffect(() => { if (selection && selection.kind !== entry) setEntry(selection.kind); /* keep in sync */ }, [selection]);
@@ -3345,22 +3401,29 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
           <SearchInput value={q} onChange={setQ} placeholder={`Search ${entry}s…`} />
           <div style={{ marginTop: 6, fontSize: 11, color: T.textMuted }}>{filtered.length.toLocaleString()} of {listData.length.toLocaleString()}</div>
         </div>
-        <div style={{ overflow: "auto", flex: 1 }}>
-          {filtered.slice(0, 2000).map(it => {
+        {/* v3.4: virtualized — only visible rows render, so the full filtered set
+            (thousands of fields) scrolls smoothly without a 2000-item cap. Row
+            height is uniform per entry type (CustomPermission renders two lines). */}
+        <VirtualList
+          items={filtered}
+          rowHeight={entry === "CustomPermission" ? 48 : 34}
+          getKey={itemKey}
+          style={{ flex: 1 }}
+          renderRow={it => {
             const isSelected = selection && selection.kind === entry && itemKey(selection.item) === itemKey(it);
             return (
-              <div key={itemKey(it)} onClick={() => pick(it)}
+              <div onClick={() => pick(it)}
                 className="pe-row"
                 style={{
+                  height: "100%", boxSizing: "border-box",
                   padding: "8px 12px",
                   borderLeft: isSelected ? `3px solid ${T.accent}` : "3px solid transparent",
                   background: isSelected ? T.cardHover : "transparent",
                   fontSize: 13, cursor: "pointer",
                 }}>{renderItem(it)}</div>
             );
-          })}
-          {filtered.length > 2000 && <div style={{ padding: 12, color: T.textMuted, fontSize: 11 }}>…showing first 2000. Refine search for more.</div>}
-        </div>
+          }}
+        />
       </div>
 
       <div style={{ overflow: "auto", padding: 24 }}>
@@ -3422,11 +3485,12 @@ function ScenarioA({ idx, nav, impactMatrix, setImpactMatrix }) {
   useEffect(() => {
     if (impactMatrix || running) return;
     setRunning(true);
-    setTimeout(() => {
-      const rows = precomputeImpactMatrix(idx, (d, t) => setProgress({ done: d, total: t }));
-      setImpactMatrix(rows);
-      setRunning(false);
-    }, 30);
+    let cancelled = false; // v3.4: don't write/flip state if idx changes or tab unmounts
+    // v3.4: run the impact matrix chunked so the UI (incl. the progress bar) stays
+    // responsive instead of freezing for 5–15s on a large org.
+    asyncChunked(() => precomputeImpactMatrixGen(idx, (d, t) => { if (!cancelled) setProgress({ done: d, total: t }); }))
+      .then(rows => { if (!cancelled) { setImpactMatrix(rows); setRunning(false); } });
+    return () => { cancelled = true; };
   }, [impactMatrix, running, idx, setImpactMatrix]);
 
   const rows = impactMatrix || [];
@@ -6767,9 +6831,10 @@ export default function PermissionExplorer() {
       try {
         setComputingProgress("Phase 1/4 — Impact Matrix…");
         await yieldFrame();
-        const im = precomputeImpactMatrix(idx, (d, t) => {
+        // v3.4: chunked so the progress banner actually paints during this phase.
+        const im = await asyncChunked(() => precomputeImpactMatrixGen(idx, (d, t) => {
           if ((d & 255) === 0) setComputingProgress(`Phase 1/4 — Impact Matrix (${d}/${t})`);
-        });
+        }));
         setImpactMatrix(im);
 
         setComputingProgress("Phase 2/4 — Delete candidates…");
