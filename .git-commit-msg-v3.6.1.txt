@@ -1,0 +1,21 @@
+v3.6.1 — BUG-8b: show profile name (not implicit PS Id) for profile-owned PermSets
+
+Profile-owned (implicit) PermissionSets have a Label/Name equal to their
+implicit PS Id (e.g. 00e3g000000HjPAAA0), so provenance views rendered a raw
+Id instead of the owning Profile name. Resolved across every affected render
+path:
+
+- Index: new inverse map profileByImplicitPsId (implicit PS.Id -> Profile),
+  exported alongside profileImplicitPsByProfileId.
+- New grantorLabel(idx, parentId, fallback) helper: resolves a profile-owned
+  PermSet to "<Profile> (profile)", else falls back to permset label/id.
+- Field detail (PermSet / Group / Muting grant tables) now show profile name.
+- Object detail "Grantors" table resolves the name and click-through now
+  navigates to the Profile rather than a no-op permset lookup.
+- resolveSourceLabel (shared by all "Granted by" pills) resolves profile-owned
+  sources to the profile name.
+
+Also includes scripts/build-pebundle.js contiguity/truncation guard (exit 5 on
+short fetch vs EXPECTED_COUNTS.json) and package-lock.json.
+
+Version bumped to v3.6.1 (APP_VERSION + package.json).

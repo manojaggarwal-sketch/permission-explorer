@@ -20,6 +20,19 @@
 //   2 = stage dir missing or empty
 //   3 = at least one expected stage file missing or unreadable
 //   4 = atomic rotation failed (bundle may be partially in place; check --out)
+//   5 = row-count contiguity check failed (a dataset is short vs its COUNT();
+//       likely silent connector truncation — bundle NOT written)
+//
+// Contiguity / truncation guard:
+//   The Salesforce connector can silently drop rows from the middle of a large
+//   result while still reporting done:true and a plausible record count. To
+//   catch this, the fetch step writes EXPECTED_COUNTS.json into the stage dir,
+//   mapping each dataset key to its authoritative SOQL COUNT(). This script
+//   compares staged rows against that count and ABORTS (exit 5) on any shortfall
+//   beyond a dataset's documented allowance, so a truncated fetch fails loudly
+//   instead of shipping a short bundle. If EXPECTED_COUNTS.json is absent the
+//   check is skipped with a warning (back-compat), but the weekly task should
+//   always write it.
 //
 // The script does NOT call Salesforce. It only reshapes and packages data the
 // caller has already fetched. Keeping fetch and packaging separate means a
@@ -68,6 +81,59 @@ function parseArgs(argv) {
   return args;
 }
 function die(code, msg) { process.stderr.write(msg + "\n"); process.exit(code); }
+
+// ---------- contiguity / truncation guard ----------
+//
+// Documented allowances: COUNT() can legitimately exceed the queryable row set
+// for objects with profile-owned / implicit rows the query API does not return.
+// For these, COUNT() - stagedRows up to `allowance` is EXPECTED, not an error.
+// Any shortfall BEYOND the allowance is treated as truncation and aborts.
+//
+//   PermissionSetTabSetting: COUNT() tallies ~2,630 profile-owned/implicit rows
+//   the query API never returns (verified 2026-06: COUNT()=16,034 vs queryable
+//   13,404). Allowance set with headroom; tighten if the org's profile count
+//   changes materially.
+const KNOWN_COUNT_ALLOWANCES = {
+  PermissionSetTabSetting: 2800,
+};
+
+// Read optional EXPECTED_COUNTS.json from the stage dir. Shape:
+//   { "PermissionSetTabSetting": 16034, "ObjectPermissions": 41234, ... }
+// Returns null if absent.
+function readExpectedCounts(stageDir) {
+  const p = path.join(stageDir, "EXPECTED_COUNTS.json");
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); }
+  catch (err) { die(3, `Failed to parse ${p}: ${err.message}`); }
+}
+
+// Compare staged row counts against authoritative COUNT()s. Aborts (exit 5) on
+// any shortfall beyond a documented allowance. Surplus (staged > expected) is
+// allowed — it can't be truncation — but is reported as a warning since it may
+// signal stale staging not fully cleaned before a re-run.
+function assertContiguity(counts, expected) {
+  if (!expected) {
+    process.stderr.write("WARN: EXPECTED_COUNTS.json absent — skipping truncation guard. The weekly task should write it.\n");
+    return;
+  }
+  const failures = [];
+  for (const d of DATASETS) {
+    if (expected[d.key] === undefined) continue; // no authoritative count for this slot
+    const exp = expected[d.key];
+    const got = counts[d.key] || 0;
+    const allowance = KNOWN_COUNT_ALLOWANCES[d.key] || 0;
+    const shortfall = exp - got;
+    if (shortfall > allowance) {
+      failures.push(`  ${d.key}: staged ${got} but COUNT()=${exp} (shortfall ${shortfall}, allowance ${allowance}) — likely truncation`);
+    } else if (got > exp) {
+      process.stderr.write(`WARN: ${d.key} staged ${got} > COUNT()=${exp}; possible stale staging from an unclean re-run.\n`);
+    }
+  }
+  if (failures.length) {
+    die(5, "Row-count contiguity check FAILED — bundle NOT written:\n" + failures.join("\n") +
+      "\nRe-fetch the affected dataset(s) (export large objects to CSV if SOQL paging truncates).");
+  }
+}
 
 // ---------- staging input ----------
 function readJsonl(filepath) {
@@ -241,6 +307,10 @@ function main() {
   if (missing.length) {
     process.stderr.write(`WARN: missing staging files for: ${missing.join(", ")} — those slots will be empty in the bundle.\n`);
   }
+
+  // 1b. Truncation guard — abort before writing anything if any dataset is
+  //     short of its authoritative COUNT() beyond a documented allowance.
+  assertContiguity(counts, readExpectedCounts(stageDir));
 
   // 2. Build CSVs + pebundle in a temp dir under --out.
   const stamp = new Date().toISOString().replace(/[:.]/g, "").slice(0, 13); // YYYYMMDDTHHMM

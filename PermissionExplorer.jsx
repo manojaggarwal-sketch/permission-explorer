@@ -498,7 +498,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-05-v3.6";
+const APP_VERSION = "2026-06-v3.6.1";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -1024,6 +1024,14 @@ function buildIndexes(datasets) {
     }
   }
 
+  // BUG-8b: inverse map implicit (profile-owned) PS.Id → owning Profile, so any
+  // view rendering a profile-owned PermSet can show the profile name, not the ID.
+  const profileByImplicitPsId = new Map();
+  for (const [pid, psId] of profileImplicitPsByProfileId.entries()) {
+    const pr = profileById.get(pid);
+    if (pr) profileByImplicitPsId.set(psId, pr);
+  }
+
   // Role filtering (UX-12 / BUG-9) — defensively drop ANY portal role, even if SOQL filter missed.
   // BUG-9 v2.6: strict — any non-empty PortalType is treated as a portal role and filtered out.
   const rolesRaw = datasets.UserRole || [];
@@ -1114,6 +1122,7 @@ function buildIndexes(datasets) {
     userById, profileById, permSetById, groupById, customPermById, roleById, usersByRole,
     roles, allSysCols,
     profileImplicitPsByProfileId,               // BUG-8 v2.6
+    profileByImplicitPsId,                      // BUG-8b: implicit PS.Id → Profile
     profileBooleansBySystemPermissionKey,       // BUG-15 v2.8
     auditTrailByPermSetLabel,                   // UX-60 v3.1
   };
@@ -1124,6 +1133,23 @@ function buildIndexes(datasets) {
 function profileFanoutIds(idx, parentId) {
   const implicit = idx.profileImplicitPsByProfileId && idx.profileImplicitPsByProfileId.get(parentId);
   return implicit ? [parentId, implicit] : [parentId];
+}
+
+// BUG-8b: human-readable label for any grantor (PermSet or profile-owned implicit PS).
+// For profile-owned PermSets the Label/Name is just the implicit PS Id, so resolve
+// the owning Profile name instead and tag it "(profile)". Falls back to label/id.
+function grantorLabel(idx, parentId, fallback) {
+  const pr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(parentId);
+  if (pr) return pr.Name + " (profile)";
+  const ps = idx.permSetById && idx.permSetById.get(parentId);
+  if (ps) {
+    if (toBool(ps.IsOwnedByProfile) && ps.ProfileId) {
+      const p2 = idx.profileById.get(ps.ProfileId);
+      if (p2) return p2.Name + " (profile)";
+    }
+    return ps.Label || ps.Name || fallback || parentId;
+  }
+  return fallback || parentId;
 }
 
 /* ============================================================================
@@ -1918,8 +1944,17 @@ function resolveSourceLabel(s, idx) {
     if (p && p.Name) return p.Name;
   }
   if (s.kind === "permset" || s.kind === "groupmember" || s.kind === "muting") {
+    // BUG-8b: profile-owned implicit PS → show owning profile name, not the Id.
+    const implicitPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(s.id);
+    if (implicitPr && implicitPr.Name) return implicitPr.Name + " (profile)";
     const ps = idx.permSetById && idx.permSetById.get(s.id);
-    if (ps) return ps.Label || ps.Name || s.id;
+    if (ps) {
+      if (toBool(ps.IsOwnedByProfile) && ps.ProfileId) {
+        const p2 = idx.profileById.get(ps.ProfileId);
+        if (p2 && p2.Name) return p2.Name + " (profile)";
+      }
+      return ps.Label || ps.Name || s.id;
+    }
   }
   if (s.kind === "group") {
     const g = idx.groupById && idx.groupById.get(s.id);
@@ -3064,7 +3099,7 @@ function ObjectDetail({ idx, obj, nav }) {
       ]} />
 
       <SubSectionTable title="Grantors (Profiles & PermSets)" rows={opRows} columns={[
-        { key: "ParentName", label: "Grantor", render: r => <span onClick={e => { e.stopPropagation(); const ps = idx.permSetById.get(r.ParentId); const pr = idx.profileById.get(r.ParentId); if (ps) nav({ kind: "PermissionSet", item: ps }); else if (pr) nav({ kind: "Profile", item: pr }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.ParentName || r.ParentId}</span> },
+        { key: "ParentName", label: "Grantor", render: r => <span onClick={e => { e.stopPropagation(); const implicitPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId); const ps = idx.permSetById.get(r.ParentId); const pr = idx.profileById.get(r.ParentId); if (implicitPr) nav({ kind: "Profile", item: implicitPr }); else if (ps) nav({ kind: "PermissionSet", item: ps }); else if (pr) nav({ kind: "Profile", item: pr }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{grantorLabel(idx, r.ParentId, r.ParentName)}</span> },
         { key: "Owner", label: "Kind", render: r => <Pill tone={r.IsOwnedByProfile ? "purple" : "accent"}>{r.IsOwnedByProfile ? "Profile" : "PermSet"}</Pill> },
         { key: "c", label: "C", render: r => <BoolFlag v={r.c} /> },
         { key: "r", label: "R", render: r => <BoolFlag v={r.r} /> },
@@ -3105,12 +3140,13 @@ function FieldDetail({ idx, field, nav }) {
     const base = { ParentId: r.ParentId, ParentName: r.ParentName, read: r.read, edit: r.edit };
     if (pr) profileGrants.push({ ...base, name: pr.Name });
     else if (ps) {
-      if (ps.Type === "Muting") mutingGrants.push({ ...base, name: ps.Label, groupIds: psToGroups.get(r.ParentId) || [], isProfileOwned: toBool(ps.IsOwnedByProfile) });
+      const label = grantorLabel(idx, r.ParentId, ps.Label);
+      if (ps.Type === "Muting") mutingGrants.push({ ...base, name: label, groupIds: psToGroups.get(r.ParentId) || [], isProfileOwned: toBool(ps.IsOwnedByProfile) });
       else {
         const groupIds = psToGroups.get(r.ParentId) || [];
         const groupNames = groupIds.map(g => (idx.groupById.get(g) || {}).MasterLabel || g);
-        if (groupIds.length) groupGrants.push({ ...base, name: ps.Label, groupIds, groupNames, isProfileOwned: toBool(ps.IsOwnedByProfile) });
-        permsetGrants.push({ ...base, name: ps.Label, isProfileOwned: toBool(ps.IsOwnedByProfile) });
+        if (groupIds.length) groupGrants.push({ ...base, name: label, groupIds, groupNames, isProfileOwned: toBool(ps.IsOwnedByProfile) });
+        permsetGrants.push({ ...base, name: label, isProfileOwned: toBool(ps.IsOwnedByProfile) });
       }
     }
   }
