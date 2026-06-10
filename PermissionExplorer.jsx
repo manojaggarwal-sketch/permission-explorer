@@ -498,7 +498,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-06-v3.6.1";
+const APP_VERSION = "2026-06-v3.7.0";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -1444,6 +1444,8 @@ function* precomputeImpactMatrixGen(idx, onProgress) {
         permSetId: a.PermSetId,
         permSetLabel: a.PermSetLabel || a.PermSetName || a.PermSetId,
         groupLabel: a.GroupId ? ((idx.groupById.get(a.GroupId)||{}).MasterLabel || a.GroupId) : "",
+        groupId: a.GroupId || "", // UX-66: raw Id for CSV export
+
         lostObjects, lostFields, lostSys,
         total,
         lost, covered, severity,
@@ -2100,7 +2102,21 @@ function ExportCSVButton({ rows, columns, filename }) {
   return (
     <button className="pe-btn secondary" style={{ padding: "4px 10px", fontSize: 11 }} disabled={!rows || !rows.length}
       onClick={() => {
-        const csv = rowsToCSV(rows, columns);
+        // UX-66: auto-append raw Salesforce Id columns (keys ending in Id/Ids) found on
+        // row objects but not already in the visible column list. Exports only — no UI change.
+        let cols = columns;
+        if (cols && rows && rows.length) {
+          const extra = [];
+          const seen = new Set(cols);
+          for (const r of rows.slice(0, 50)) {
+            if (!r || typeof r !== "object") continue;
+            for (const k of Object.keys(r)) {
+              if ((/Ids?$/.test(k) || k === "id" || k === "ids") && !seen.has(k)) { seen.add(k); extra.push(k); }
+            }
+          }
+          if (extra.length) cols = [...cols, ...extra];
+        }
+        const csv = rowsToCSV(rows, cols);
         downloadBlob(new Blob([csv], { type: "text/csv" }), filename || "export.csv");
       }}>Export CSV</button>
   );
@@ -3098,7 +3114,12 @@ function ObjectDetail({ idx, obj, nav }) {
         { label: "Fields tracked", value: fieldsByName.size, tone: "accent" },
       ]} />
 
-      <SubSectionTable title="Grantors (Profiles & PermSets)" rows={opRows} columns={[
+      {/* UX-66: enrich grantor rows with raw Ids for CSV export (permSetId; profileId when profile-owned) */}
+      <SubSectionTable title="Grantors (Profiles & PermSets)" rows={opRows.map(r => {
+        const ownPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId);
+        const pr = idx.profileById.get(r.ParentId);
+        return { ...r, permSetId: pr ? "" : r.ParentId, profileId: ownPr ? ownPr.Id : (pr ? pr.Id : "") };
+      })} columns={[
         { key: "ParentName", label: "Grantor", render: r => <span onClick={e => { e.stopPropagation(); const implicitPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId); const ps = idx.permSetById.get(r.ParentId); const pr = idx.profileById.get(r.ParentId); if (implicitPr) nav({ kind: "Profile", item: implicitPr }); else if (ps) nav({ kind: "PermissionSet", item: ps }); else if (pr) nav({ kind: "Profile", item: pr }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{grantorLabel(idx, r.ParentId, r.ParentName)}</span> },
         { key: "Owner", label: "Kind", render: r => <Pill tone={r.IsOwnedByProfile ? "purple" : "accent"}>{r.IsOwnedByProfile ? "Profile" : "PermSet"}</Pill> },
         { key: "c", label: "C", render: r => <BoolFlag v={r.c} /> },
@@ -3138,9 +3159,14 @@ function FieldDetail({ idx, field, nav }) {
     const ps = idx.permSetById.get(r.ParentId);
     const pr = idx.profileById.get(r.ParentId);
     const base = { ParentId: r.ParentId, ParentName: r.ParentName, read: r.read, edit: r.edit };
-    if (pr) profileGrants.push({ ...base, name: pr.Name });
+    if (pr) profileGrants.push({ ...base, name: pr.Name, profileId: pr.Id });
     else if (ps) {
       const label = grantorLabel(idx, r.ParentId, ps.Label);
+      // UX-66: raw Ids for CSV export — permSetId always; profileId/profileName when
+      // the grantor is a profile-owned implicit PermSet.
+      const ownPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId);
+      base.permSetId = r.ParentId;
+      if (ownPr) { base.profileId = ownPr.Id; base.profileName = ownPr.Name; }
       if (ps.Type === "Muting") mutingGrants.push({ ...base, name: label, groupIds: psToGroups.get(r.ParentId) || [], isProfileOwned: toBool(ps.IsOwnedByProfile) });
       else {
         const groupIds = psToGroups.get(r.ParentId) || [];
@@ -4022,7 +4048,7 @@ function ScenarioB({ idx, nav, deleteCandidates, setDeleteCandidates }) {
               Open in Explorer ↗
             </button>
             <ExportCSVButton rows={analysis.perUser.map(u => ({
-              user: u.userName, covered: u.covered, lostTokenCount: u.lostTokenCount,
+              user: u.userName, covered: u.covered, lostTokenCount: u.lostTokenCount, userId: u.userId,
               coveringExample: (u.coveringPerToken.find(t => t.covers.length)||{}).covers
                 ? u.coveringPerToken.filter(t => t.covers.length).map(t => `${tokenToNoun(t.token)} <- ${t.covers.map(s => s.label).join(",")}`).slice(0, 3).join(" | ")
                 : "",
@@ -5438,7 +5464,7 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
         };
         return (
         <>
-          <SubSectionTable title="Duplicate PermSets" rows={allDups.filter(d => !isDismissed(`dup|${d.a}|${d.b}`) && dupManagedFilter(d))} columns={[
+          <SubSectionTable title="Duplicate PermSets" rows={allDups.filter(d => !isDismissed(`dup|${d.a}|${d.b}`) && dupManagedFilter(d)).map(d => ({ ...d, permSetAId: d.a, permSetBId: d.b }))} columns={[
             { key: "aLabel", label: "PermSet A", render: r => (
               <span>
                 <span onClick={() => nav({ kind: "PermissionSet", item: idx.permSetById.get(r.a) })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.aLabel}</span>
@@ -5463,7 +5489,7 @@ function RedundancyTab({ idx, dismissals, setDismissals, nav, onNavToDelete,
               right={<ExportCSVButton
                 rows={reallySubsets.flatMap(s =>
                   [...s.extras.objects, ...s.extras.fields, ...s.extras.system, ...s.extras.setup]
-                    .map(t => ({ subset: s.subsetLabel, superset: s.supersetLabel, category: classifyToken(t), token: t, label: tokenToNoun(t) })))}
+                    .map(t => ({ subset: s.subsetLabel, superset: s.supersetLabel, category: classifyToken(t), token: t, label: tokenToNoun(t), subsetId: s.subsetId, supersetId: s.supersetId })))}
                 columns={["subset", "superset", "category", "token", "label"]}
                 filename="subset_extras.csv" />} />
             {reallySubsets.length === 0 && <Empty text="No subset relationships detected." />}
@@ -5820,7 +5846,7 @@ function MigrationTab({ idx, nav, migrationData: migrationDataProp, setMigration
         <div><b style={{ color: T.text }}>Muting candidates</b> — per profile, the tokens present in the shared base but not in that profile. Implemented as a Muting PermSet so the consolidated group doesn't over-grant users who didn't have that permission originally.</div>
       </div>
 
-      <SubSectionTable title="Profile Pairs (>70% similarity)" rows={data.pairs} columns={[
+      <SubSectionTable title="Profile Pairs (>70% similarity)" rows={data.pairs.map(r => ({ ...r, profileAId: r.a, profileBId: r.b }))} columns={[
         { key: "aName", label: "Profile A", render: r => <span onClick={() => { const p = idx.profileById.get(r.a); if (p) nav({ kind: "Profile", item: p }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.aName}</span> },
         { key: "bName", label: "Profile B", render: r => <span onClick={() => { const p = idx.profileById.get(r.b); if (p) nav({ kind: "Profile", item: p }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{r.bName}</span> },
         { key: "score", label: "Jaccard", render: r => <Pill tone="accent">{(r.score * 100).toFixed(0)}%</Pill> },
