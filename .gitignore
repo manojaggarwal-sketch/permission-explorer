@@ -17,3 +17,6 @@ bundles/
 dist/
 build/
 *.tgz
+
+# Commit-message scratch files
+.git-commit-msg-*.txt

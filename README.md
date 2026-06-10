@@ -2,9 +2,9 @@
 
 A single-file React artifact for interrogating Salesforce permission data. Admins export CSVs from their org, upload them into the app, and every analysis runs in-memory — no live Salesforce connection, no OAuth, no Connected App.
 
-This is the v3.1 feature release. The artifact is strictly CSV-driven: there is no built-in demo dataset, and the app never makes any network calls at runtime. Data enters the app through CSV upload or `.pebundle` import, and persists across sessions via an IndexedDB cache.
+This is the v3.7 release. The artifact is strictly CSV-driven: there is no built-in demo dataset, and the app never makes any network calls at runtime. Data enters the app through CSV upload or `.pebundle` import, and persists across sessions via an IndexedDB cache.
 
-v3.1 adds: UX-57 managed-package filtering, UX-58/59 Mergable and Duplicate PermSets tabs with consolidation marks, UX-60 last assignment activity via SetupAuditTrail, UX-61 Dormant/Empty/Single-User Profile analysis, UX-62 orphaned PermSet cross-linking, UX-63 Simulation Mode (what-if analysis with cascading propagation and named pebundle export), BUG-20/21/22 performance and persistence fixes. See `requirements_v3_0.md` for full specs.
+Highlights since v3.1: UX-64 interactive paired-diff explorer with toggle filters (v3.2); internal refactor + centralized `APP_VERSION` (v3.3); PERF-1/PERF-2 async-chunked precomputes plus `VirtualList`/`VirtualTable` windowing for large lists and tables (v3.4–v3.5); UX-65 Compare Users — side-by-side effective-permission diff with one-click "make A match B" simulation (v3.6); BUG-8b profile-owned PermSets resolve to the owning Profile name in all provenance views (v3.6.1); UX-66 every CSV export now includes raw Salesforce Id columns alongside resolved names, ready for Data Loader / joins (v3.7). The v3.1 feature set (managed-package filtering, Mergable/Duplicate PermSets, dormant-profile analysis, Simulation Mode, etc.) is all still in place. See `requirements_v3_0.md` §2 for full specs and the version-history table at the bottom for the complete change log.
 
 ## Layout
 
@@ -18,6 +18,8 @@ PermissionExplorer/
 ├── requirements_v2_5.md         # Historical specs.
 ├── requirements_v2_6.md
 ├── requirements_v2_7.md
+├── scripts/build-pebundle.js     # Builds a .pebundle from the 13 raw CSVs (with row-count guard).
+├── bundles/                      # Local CSV/pebundle outputs from the weekly task. Gitignored — real org data.
 └── README.md
 ```
 
@@ -43,7 +45,7 @@ The scheduled task is the simplest path. It keeps Salesforce credentials out of 
 
 ## The 13 Required Export Queries
 
-See `requirements_v2_8.md` §5.1 for the canonical SOQL. The Admin tab also displays every query inline with a Copy button. The 13 queries map 1:1 to the 13 expected CSV files.
+See `requirements_v3_0.md` §5.1 for the canonical SOQL (carries the v3.0.2 BUG-19 correction — implicit profile-owned PermSets included, `ProfileId` selected). The Admin tab also displays every query inline with a Copy button. The 13 queries map 1:1 to the 13 expected CSV files.
 
 ## Safety
 
