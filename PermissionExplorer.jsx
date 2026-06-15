@@ -1,7 +1,17 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-05-v3.6
+  Version: 2026-06-v3.7.1
   Claude.ai artifact — single file, default export.
+
+  (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, and v3.7.1 are tracked
+  in requirements_v3_0.md "Version History" — the canonical changelog.)
+
+  v3.7.1 — fix: BUG-23 (§2.94). Objects with field-level security but no
+    ObjectPermissions row were dropped from object views. New fieldOnlyObjectRows()
+    helper surfaces "field-only" objects (FLS-only badge) in the grantor Objects
+    table (ParentDetailSubSections), user Effective Objects (effectiveObjects),
+    and the Object reverse-lookup Grantors table (ObjectDetail). Display-only;
+    stat cards keep object-level "granted" semantics; signature diffs unaffected.
 
   v3.6 — feature: Compare Users (UX-65). New tab that diffs two users'
     EFFECTIVE permissions side by side: assignment-source diff (which profile /
@@ -498,7 +508,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-06-v3.7.0";
+const APP_VERSION = "2026-06-v3.7.1";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -1214,6 +1224,23 @@ function effectiveObjects(idx, userId) {
     const g = grant.get(sobj);
     if (!g) continue;
     ["c","r","e","d","va","ma"].forEach(k => { if (m[k] && g[k]) { g[k] = false; g.sources[k+"_mutedBy"] = (g.sources[k+"_mutedBy"] || []).concat(m.sources[k]); } });
+  }
+  // BUG-23: surface "field-only" objects — the user has FieldPermissions (FLS) on
+  // an object but no ObjectPermissions row for it anywhere in their sources. These
+  // objects were previously invisible because the object map is built solely from
+  // ObjectPermissions. We add them with CRUD all-false + fieldOnly:true so they
+  // appear in object-centric views. NB: userEffectiveSignature only emits O: tokens
+  // on truthy CRUD, so these synthetic rows never produce spurious comparison diffs.
+  for (const s of srcs) {
+    if (s.kind === "muting") continue;
+    const ids = s.kind === "profile" ? profileFanoutIds(idx, s.id) : [s.id];
+    for (const pid of ids) {
+      for (const f of idx.fieldPermsByParent.get(pid) || []) {
+        if (!f.read && !f.edit) continue;
+        if (grant.has(f.SobjectType)) continue;
+        grant.set(f.SobjectType, { c:false,r:false,e:false,d:false,va:false,ma:false, fieldOnly:true, sources:{c:[],r:[],e:[],d:[],va:[],ma:[]} });
+      }
+    }
   }
   return grant;
 }
@@ -2408,12 +2435,33 @@ function BoolFlag({ v, changed }) {
 // Used by Profile detail AND PermSet detail (BUG-5).
 // BUG-8 v2.6: profile parentIds fan out through the implicit PermissionSet so
 // object/field/sys rows aren't empty in real SOQL-loaded datasets.
+// BUG-23: objects that carry FieldPermissions (FLS) but no ObjectPermissions row
+// for a grantor are invisible in object-centric views built solely from
+// ObjectPermissions. Given the already-collected object-perm rows and field-perm
+// rows for a grantor, return synthetic "field-only" object rows (CRUD all false,
+// fieldOnly:true) for the SobjectTypes that appear only in FieldPermissions.
+function fieldOnlyObjectRows(objPermRows, fieldRows) {
+  const withObjPerm = new Set(objPermRows.map(o => o.SobjectType));
+  const byObj = new Map();
+  for (const f of fieldRows || []) {
+    if (!f.SobjectType || withObjPerm.has(f.SobjectType)) continue;
+    const cur = byObj.get(f.SobjectType)
+      || { SobjectType: f.SobjectType, c:false, r:false, e:false, d:false, va:false, ma:false, fieldOnly:true, fieldGrantCount:0 };
+    cur.fieldGrantCount++;
+    byObj.set(f.SobjectType, cur);
+  }
+  return [...byObj.values()];
+}
+
 function ParentDetailSubSections({ idx, parentId, onNavObject, onNavField, onDiag }) {
   const [scopedObj, setScopedObj] = useState("");
   const fanoutIds = profileFanoutIds(idx, parentId);
   const collect = (m) => fanoutIds.flatMap(id => m.get(id) || []);
-  const objRows = collect(idx.objPermsByParent);
+  const objPermRows = collect(idx.objPermsByParent);
   const fieldRows = collect(idx.fieldPermsByParent);
+  // BUG-23: append field-only objects so OrderItem-style FLS-without-CRUD grants
+  // are no longer dropped from the Objects list / count.
+  const objRows = [...objPermRows, ...fieldOnlyObjectRows(objPermRows, fieldRows)];
 
   // BUG-15 v2.8: System Perms merge — union across every fan-out id AND tag each
   // granted row with its source (Profile / Implicit PS / both). profileBooleans
@@ -2468,6 +2516,8 @@ function ParentDetailSubSections({ idx, parentId, onNavObject, onNavField, onDia
     { key: "SobjectType", label: "Object", width: 160, render: r => (
       <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
         {r.SobjectType}
+        {/* BUG-23: flag objects present only via FLS (no ObjectPermissions row). */}
+        {r.fieldOnly && <Pill tone="yellow" title="Field-level security granted, but no object-level CRUD row for this grantor">FLS-only{r.fieldGrantCount ? ` (${r.fieldGrantCount})` : ""}</Pill>}
         <button className="pe-btn ghost" style={{ padding: "2px 6px", fontSize: 10 }} onClick={e => { e.stopPropagation(); setScopedObj(r.SobjectType); }}>scope</button>
       </span>
     ) },
@@ -3095,6 +3145,18 @@ function ObjectDetail({ idx, obj, nav }) {
   const name = obj.SobjectType;
   const opRows = idx.objPermsBySobj.get(name) || [];
   const fpRows = idx.fieldPermsBySobj.get(name) || [];
+  // BUG-23: include grantors that grant FLS on this object but have no
+  // ObjectPermissions row — otherwise they are invisible in this reverse lookup
+  // (the OrderItem / Bullhorn Community Profile case).
+  const opParents = new Set(opRows.map(r => r.ParentId));
+  const fieldOnlyGrantors = new Map();
+  for (const r of fpRows) {
+    if (opParents.has(r.ParentId)) continue;
+    let cur = fieldOnlyGrantors.get(r.ParentId);
+    if (!cur) { cur = { SobjectType: name, ParentId: r.ParentId, ParentName: r.ParentName, IsOwnedByProfile: r.IsOwnedByProfile, c:false, r:false, e:false, d:false, va:false, ma:false, fieldOnly:true, fieldGrantCount:0 }; fieldOnlyGrantors.set(r.ParentId, cur); }
+    cur.fieldGrantCount++;
+  }
+  const grantorRows = [...opRows, ...fieldOnlyGrantors.values()];
   // Group field rows by Field to show "who grants what" for each field.
   const fieldsByName = new Map();
   for (const r of fpRows) {
@@ -3110,18 +3172,24 @@ function ObjectDetail({ idx, obj, nav }) {
       <HeaderBlock title={name} subtitle="Object permission reverse lookup" tags={[<Pill key="t" tone="purple">Object</Pill>]} />
 
       <StatsRow stats={[
-        { label: "Grantors", value: opRows.length, tone: "purple" },
+        { label: "Grantors", value: grantorRows.length, tone: "purple" },
         { label: "Fields tracked", value: fieldsByName.size, tone: "accent" },
       ]} />
 
       {/* UX-66: enrich grantor rows with raw Ids for CSV export (permSetId; profileId when profile-owned) */}
-      <SubSectionTable title="Grantors (Profiles & PermSets)" rows={opRows.map(r => {
+      <SubSectionTable title="Grantors (Profiles & PermSets)" rows={grantorRows.map(r => {
         const ownPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId);
         const pr = idx.profileById.get(r.ParentId);
         return { ...r, permSetId: pr ? "" : r.ParentId, profileId: ownPr ? ownPr.Id : (pr ? pr.Id : "") };
       })} columns={[
         { key: "ParentName", label: "Grantor", render: r => <span onClick={e => { e.stopPropagation(); const implicitPr = idx.profileByImplicitPsId && idx.profileByImplicitPsId.get(r.ParentId); const ps = idx.permSetById.get(r.ParentId); const pr = idx.profileById.get(r.ParentId); if (implicitPr) nav({ kind: "Profile", item: implicitPr }); else if (ps) nav({ kind: "PermissionSet", item: ps }); else if (pr) nav({ kind: "Profile", item: pr }); }} style={{ color: T.accentLight, cursor: "pointer" }}>{grantorLabel(idx, r.ParentId, r.ParentName)}</span> },
-        { key: "Owner", label: "Kind", render: r => <Pill tone={r.IsOwnedByProfile ? "purple" : "accent"}>{r.IsOwnedByProfile ? "Profile" : "PermSet"}</Pill> },
+        { key: "Owner", label: "Kind", render: r => (
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <Pill tone={r.IsOwnedByProfile ? "purple" : "accent"}>{r.IsOwnedByProfile ? "Profile" : "PermSet"}</Pill>
+            {/* BUG-23: grantor reaches this object via FLS only (no object-level CRUD row). */}
+            {r.fieldOnly && <Pill tone="yellow" title="Field-level security granted, but no object-level CRUD row">FLS-only{r.fieldGrantCount ? ` (${r.fieldGrantCount})` : ""}</Pill>}
+          </span>
+        ) },
         { key: "c", label: "C", render: r => <BoolFlag v={r.c} /> },
         { key: "r", label: "R", render: r => <BoolFlag v={r.r} /> },
         { key: "e", label: "E", render: r => <BoolFlag v={r.e} /> },
