@@ -1,10 +1,20 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-06-v3.7.1
+  Version: 2026-08-v3.8.0
   Claude.ai artifact — single file, default export.
 
-  (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, and v3.7.1 are tracked
-  in requirements_v3_0.md "Version History" — the canonical changelog.)
+  (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, v3.7.1, and v3.8.0 are
+  tracked in requirements_v3_0.md "Version History" — the canonical changelog.)
+
+  v3.8.0 — data: DATA-2 (§2.95). SOQL.profile and SOQL.sysPerms expanded from
+    7/15 to 80/88 Permissions* columns — added PermissionsQueryAllFiles plus 72
+    other governance-relevant system permissions (data access/query-scope,
+    user/access admin, identity/session security, privacy/compliance,
+    metadata/packaging/deploy). SYSPERM_COLS updated to match so all 88 columns
+    are first-class instead of falling through the extraCols auto-detect path.
+    No rendering changes — the tolerant CSV parser and tokenToNoun() already
+    handled unrecognized Permissions* columns generically. Mirrored in
+    requirements_v3_0.md §5.1 Query 1/13 and scripts/weekly-refresh.sh.
 
   v3.7.1 — fix: BUG-23 (§2.94). Objects with field-level security but no
     ObjectPermissions row were dropped from object views. New fieldOnlyObjectRows()
@@ -393,8 +403,12 @@ function rowsToCSV(rows, columns) {
  * 3. SOQL QUERIES (Section 5.1)
  * ==========================================================================*/
 const SOQL = {
+  // DATA-2 v3.8: expanded from 7 to 80 Permissions* columns (see requirements_v3_0.md §2.95) —
+  // adds PermissionsQueryAllFiles plus 72 other governance-relevant system permissions
+  // (data access/query-scope, user/access admin, identity/session security, privacy/compliance,
+  // metadata/packaging/deploy). Column list kept identical to SOQL.sysPerms below.
   profile:
-    "SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, UserLicense.Name, LastModifiedDate FROM Profile ORDER BY Name",
+    "SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, PermissionsQueryAllFiles, PermissionsQueryNonVetoedFiles, PermissionsDeleteSalesforceFiles, PermissionsDownloadMaliciousFiles, PermissionsManageMaliciousFiles, PermissionsCanQueryForeignTables, PermissionsRecordVisibilityAPI, PermissionsViewAllForeignKeyNames, PermissionsViewAllCustomSettings, PermissionsViewAllFieldsGlobal, PermissionsManageFilesAndAttachments, PermissionsSelectFilesFromSalesforce, PermissionsViewContent, PermissionsManageInternalUsers, PermissionsManageProfilesPermissionsets, PermissionsAssignPermissionSets, PermissionsResetPasswords, PermissionsFreezeUsers, PermissionsManageSharing, PermissionsManageIpAddresses, PermissionsManagePasswordPolicies, PermissionsManageLoginAccessPolicies, PermissionsPasswordNeverExpires, PermissionsViewAllUsers, PermissionsViewAllProfiles, PermissionsManageUnlistedGroups, PermissionsManageSessionPermissionSets, PermissionsDelegatedPortalUserAdmin, PermissionsApiUserOnly, PermissionsManageTwoFactor, PermissionsForceTwoFactor, PermissionsDelegatedTwoFactor, PermissionsTwoFactorApi, PermissionsSkipIdentityConfirmation, PermissionsIdentityEnabled, PermissionsIdentityConnect, PermissionsManageAuthProviders, PermissionsManageRemoteAccess, PermissionsAllowLightningLogin, PermissionsMonitorLoginHistory, PermissionsManageNetworks, PermissionsViewEventLogFiles, PermissionsUseAnyApiAuth, PermissionsClientSecretRotation, PermissionsViewClientSecret, PermissionsViewUserPII, PermissionsPrivacyDataAccess, PermissionsModifyDataClassification, PermissionsConsentApiUpdate, PermissionsManageCustomerDataOptOut, PermissionsManageGlobalPrivacyCenterVO, PermissionsViewAllDataGovTags, PermissionsModifyAllDataGovTags, PermissionsViewAllDataGovPolicies, PermissionsModifyAllDataGovPolicies, PermissionsViewDataGovTab, PermissionsUseCompliantDataSharing, PermissionsModifyMetadata, PermissionsInstallPackaging, PermissionsPublishPackaging, PermissionsCreatePackaging, PermissionsDownloadPackageVersionZips, PermissionsManageSandboxes, PermissionsManageDevSandboxes, PermissionsManageNamedCredentials, PermissionsManageCertificates, PermissionsManageCertificatesExpiration, PermissionsViewSecurityCommandCenter, PermissionsViewHealthCheck, PermissionsManageHealthCheck, PermissionsViewHealthAssessments, PermissionsManageHealthAssessments, PermissionsCanApproveUninstalledApps, UserLicense.Name, LastModifiedDate FROM Profile ORDER BY Name",
   // BUG-8 v2.6: must load implicit profile-owned PermissionSets to join Profile->ObjectPermissions.
   // Query is unfiltered; index builder splits implicit (IsOwnedByProfile=true) from regular.
   // UX-57 v3.1: NamespacePrefix added so IsManaged flag can be derived at index time.
@@ -424,8 +438,11 @@ const SOQL = {
     "SELECT Id, SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet') ORDER BY Parent.Name, SetupEntityType",
   customPerm:
     "SELECT Id, DeveloperName, MasterLabel FROM CustomPermission ORDER BY MasterLabel",
+  // DATA-2 v3.8: same 73-field expansion as SOQL.profile above — column list kept identical
+  // between the two queries so Profile and PermissionSet detail views show the same System
+  // Permissions set (requirements_v3_0.md §2.95).
   sysPerms:
-    "SELECT Id, Name, Label, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsManageCustomPermissions, PermissionsApiEnabled, PermissionsBulkApiHardDelete, PermissionsDataExport, PermissionsViewSetup, PermissionsManageRoles, PermissionsRunReports, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Label",
+    "SELECT Id, Name, Label, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsManageCustomPermissions, PermissionsApiEnabled, PermissionsBulkApiHardDelete, PermissionsDataExport, PermissionsViewSetup, PermissionsManageRoles, PermissionsRunReports, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, PermissionsQueryAllFiles, PermissionsQueryNonVetoedFiles, PermissionsDeleteSalesforceFiles, PermissionsDownloadMaliciousFiles, PermissionsManageMaliciousFiles, PermissionsCanQueryForeignTables, PermissionsRecordVisibilityAPI, PermissionsViewAllForeignKeyNames, PermissionsViewAllCustomSettings, PermissionsViewAllFieldsGlobal, PermissionsManageFilesAndAttachments, PermissionsSelectFilesFromSalesforce, PermissionsViewContent, PermissionsManageInternalUsers, PermissionsManageProfilesPermissionsets, PermissionsAssignPermissionSets, PermissionsResetPasswords, PermissionsFreezeUsers, PermissionsManageSharing, PermissionsManageIpAddresses, PermissionsManagePasswordPolicies, PermissionsManageLoginAccessPolicies, PermissionsPasswordNeverExpires, PermissionsViewAllUsers, PermissionsViewAllProfiles, PermissionsManageUnlistedGroups, PermissionsManageSessionPermissionSets, PermissionsDelegatedPortalUserAdmin, PermissionsApiUserOnly, PermissionsManageTwoFactor, PermissionsForceTwoFactor, PermissionsDelegatedTwoFactor, PermissionsTwoFactorApi, PermissionsSkipIdentityConfirmation, PermissionsIdentityEnabled, PermissionsIdentityConnect, PermissionsManageAuthProviders, PermissionsManageRemoteAccess, PermissionsAllowLightningLogin, PermissionsMonitorLoginHistory, PermissionsManageNetworks, PermissionsViewEventLogFiles, PermissionsUseAnyApiAuth, PermissionsClientSecretRotation, PermissionsViewClientSecret, PermissionsViewUserPII, PermissionsPrivacyDataAccess, PermissionsModifyDataClassification, PermissionsConsentApiUpdate, PermissionsManageCustomerDataOptOut, PermissionsManageGlobalPrivacyCenterVO, PermissionsViewAllDataGovTags, PermissionsModifyAllDataGovTags, PermissionsViewAllDataGovPolicies, PermissionsModifyAllDataGovPolicies, PermissionsViewDataGovTab, PermissionsUseCompliantDataSharing, PermissionsModifyMetadata, PermissionsInstallPackaging, PermissionsPublishPackaging, PermissionsCreatePackaging, PermissionsDownloadPackageVersionZips, PermissionsManageSandboxes, PermissionsManageDevSandboxes, PermissionsManageNamedCredentials, PermissionsManageCertificates, PermissionsManageCertificatesExpiration, PermissionsViewSecurityCommandCenter, PermissionsViewHealthCheck, PermissionsManageHealthCheck, PermissionsViewHealthAssessments, PermissionsManageHealthAssessments, PermissionsCanApproveUninstalledApps FROM PermissionSet WHERE IsOwnedByProfile = false ORDER BY Label",
 };
 
 // One row per required file (Section 3.3). Mirrors the Admin-tab card list.
@@ -450,11 +467,45 @@ const FILES = [
 const FILE_BY_KEY = Object.fromEntries(FILES.map(f => [f.key, f]));
 
 // Expected system-permission columns for Query 13 (tolerant parser — see 5.1).
+// DATA-2 v3.8: expanded from 12 to 85 first-class columns (requirements_v3_0.md §2.95).
+// PermissionsTransferAnyEntity/Lead/Case (added v3.0.1) and the 73 DATA-2 additions below were
+// previously picked up only via the extraCols auto-detect path (~line 907); listing them here
+// makes them first-class and removes the "extra column loaded" info banner for them.
 const SYSPERM_COLS = [
   "PermissionsModifyAllData","PermissionsViewAllData","PermissionsManageUsers",
   "PermissionsAuthorApex","PermissionsCustomizeApplication","PermissionsManageCustomPermissions",
   "PermissionsApiEnabled","PermissionsBulkApiHardDelete","PermissionsDataExport",
   "PermissionsViewSetup","PermissionsManageRoles","PermissionsRunReports",
+  "PermissionsTransferAnyEntity","PermissionsTransferAnyLead","PermissionsTransferAnyCase",
+  // DATA-2 v3.8 — Data access / query-scope
+  "PermissionsQueryAllFiles","PermissionsQueryNonVetoedFiles","PermissionsDeleteSalesforceFiles",
+  "PermissionsDownloadMaliciousFiles","PermissionsManageMaliciousFiles","PermissionsCanQueryForeignTables",
+  "PermissionsRecordVisibilityAPI","PermissionsViewAllForeignKeyNames","PermissionsViewAllCustomSettings",
+  "PermissionsViewAllFieldsGlobal","PermissionsManageFilesAndAttachments","PermissionsSelectFilesFromSalesforce",
+  "PermissionsViewContent",
+  // DATA-2 v3.8 — User / access administration
+  "PermissionsManageInternalUsers","PermissionsManageProfilesPermissionsets","PermissionsAssignPermissionSets",
+  "PermissionsResetPasswords","PermissionsFreezeUsers","PermissionsManageSharing","PermissionsManageIpAddresses",
+  "PermissionsManagePasswordPolicies","PermissionsManageLoginAccessPolicies","PermissionsPasswordNeverExpires",
+  "PermissionsViewAllUsers","PermissionsViewAllProfiles","PermissionsManageUnlistedGroups",
+  "PermissionsManageSessionPermissionSets","PermissionsDelegatedPortalUserAdmin","PermissionsApiUserOnly",
+  // DATA-2 v3.8 — Identity / session security
+  "PermissionsManageTwoFactor","PermissionsForceTwoFactor","PermissionsDelegatedTwoFactor","PermissionsTwoFactorApi",
+  "PermissionsSkipIdentityConfirmation","PermissionsIdentityEnabled","PermissionsIdentityConnect",
+  "PermissionsManageAuthProviders","PermissionsManageRemoteAccess","PermissionsAllowLightningLogin",
+  "PermissionsMonitorLoginHistory","PermissionsManageNetworks","PermissionsViewEventLogFiles",
+  "PermissionsUseAnyApiAuth","PermissionsClientSecretRotation","PermissionsViewClientSecret",
+  // DATA-2 v3.8 — Privacy / compliance / classification
+  "PermissionsViewUserPII","PermissionsPrivacyDataAccess","PermissionsModifyDataClassification",
+  "PermissionsConsentApiUpdate","PermissionsManageCustomerDataOptOut","PermissionsManageGlobalPrivacyCenterVO",
+  "PermissionsViewAllDataGovTags","PermissionsModifyAllDataGovTags","PermissionsViewAllDataGovPolicies",
+  "PermissionsModifyAllDataGovPolicies","PermissionsViewDataGovTab","PermissionsUseCompliantDataSharing",
+  // DATA-2 v3.8 — Metadata / packaging / deploy
+  "PermissionsModifyMetadata","PermissionsInstallPackaging","PermissionsPublishPackaging","PermissionsCreatePackaging",
+  "PermissionsDownloadPackageVersionZips","PermissionsManageSandboxes","PermissionsManageDevSandboxes",
+  "PermissionsManageNamedCredentials","PermissionsManageCertificates","PermissionsManageCertificatesExpiration",
+  "PermissionsViewSecurityCommandCenter","PermissionsViewHealthCheck","PermissionsManageHealthCheck",
+  "PermissionsViewHealthAssessments","PermissionsManageHealthAssessments","PermissionsCanApproveUninstalledApps",
 ];
 
 /* ============================================================================
@@ -508,7 +559,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-06-v3.7.1";
+const APP_VERSION = "2026-08-v3.8.0";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
