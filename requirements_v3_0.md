@@ -1936,6 +1936,52 @@ No rendering changes are required: the CSV parser already auto-detects any `Perm
 
 ---
 
+### 2.97 UX-67 — System Permission Reverse Lookup (new Explorer entry point) — IMPLEMENTED in v3.9.0
+
+> **Status:** Requested by Manoj directly after §2.95/§2.96 (DATA-2/BUG-24) shipped, in response to "how do I see which permission sets have Query All Files" having no answer inside the app itself — only via CSV/SOQL outside it. Implemented same day.
+
+**Problem.** Every other grantable thing in the app has a reverse lookup: pick an Object and see every Profile/PermSet that grants it (`ObjectDetail`); pick a Field and see its provenance chain (`FieldDetail`); pick a Custom Permission and see who grants it (`CustomPermissionDetail`). System Permissions (the 88 `Permissions*` boolean columns tracked per §2.95 DATA-2, including `PermissionsQueryAllFiles`) had no equivalent — the only way to answer "who has Query All Files" was to open the exported CSV directly or run SOQL outside the app, defeating the point of a browsable explorer.
+
+**Design.** New Explorer entry point, `System Permissions`, added to `ENTRY_POINTS` alongside the existing 10 (Users, Profiles, Permission Sets, PermSet Groups, Objects, Fields, Roles, Apex Classes, Visualforce Pages, Custom Permissions). Picking it lists every tracked `Permissions*` column (sourced from `idx.allSysCols` — the same forward-compatible union already used by the System Permissions sub-section on Profile/PermSet detail views, so it automatically covers all 88 DATA-2 columns plus any future `extraCols` picked up from a CSV without a code change). Selecting one opens `SystemPermissionDetail`, modeled directly on `CustomPermissionDetail` (closest existing analog — both are boolean-flag grants with no CRUD nuance):
+
+- **Granting Permission Sets** table — every non-implicit PermSet where `sysPermsByParent.get(id).perms[key] === true`, click-through to `PermissionSet` detail.
+- **Granting Profiles** table — every Profile where the same is true (Profile rows live in the same `sysPermsByParent` map per §2.72/§2.64 BUG-15/BUG-16, keyed by Profile.Id directly — no implicit-PermSet fan-out needed, unlike Object/Field lookups).
+- **Impacted active users** stat — count of active Standard users whose effective sources (`userSources()`: profile + directly-assigned PermSets, excluding muting PermSets since system permissions cannot be muted in Salesforce) include a source with this permission `true`. This is the single most actionable number for a security review ("how many humans currently have Query All Files") and has no existing analog on Object/Field/CustomPermission detail (those only count PermSets/Profiles, not people) — added here because system permissions are inherently a governance/security surface where headcount matters more than for a random field's FLS.
+- Both tables use the existing `SubSectionTable` component, which gives per-table search and CSV export for free (same mechanism every other detail view uses).
+- Display uses the raw API name with the `Permissions` prefix stripped (e.g. `QueryAllFiles`), consistent with the existing `tokenToNoun()` convention and the already-settled §2.72 Decision 4(a) (no friendly-name mapping — keep API names, lowest effort, forward-compatible).
+
+**Changes (implemented in v3.9.0):**
+- `ENTRY_POINTS` — new `{ key: "SystemPermission", label: "System Permissions" }` entry.
+- `ExplorerTab` — new `listData`/`filtered`/`renderItem`/`itemKey` branches for `entry === "SystemPermission"`, sourced from `idx.allSysCols`.
+- New `SystemPermissionDetail({ idx, item, nav })` component (placed next to `CustomPermissionDetail`), wired into the Explorer's selection-dispatch switch (`selection.kind === "SystemPermission" ? <SystemPermissionDetail .../> : ...`).
+- No data-pipeline changes — this reads `idx.sysPermsByParent` / `idx.allSysCols`, both already populated by DATA-2 (§2.95). No new SOQL, no bundle rebuild needed to use this feature against the current bundle.
+- esbuild verified. Header/`APP_VERSION`/package.json/index.html bumped to v3.9.0.
+
+**Acceptance criteria:**
+- Explorer → System Permissions → search "QueryAllFiles" → select it → see "System Admin" and "z: System Audit Fields" under Granting Permission Sets, "Analytics Cloud Integration User" under Granting Profiles (matches the counts independently verified via SOQL and CSV in chat during §2.95/§2.96).
+- Clicking a row in either table navigates to that PermSet's/Profile's own detail view.
+- CSV export works on both tables via the existing `SubSectionTable` mechanism.
+- A permission with zero grantors anywhere shows both tables empty (not an error) and an impacted-user count of 0.
+
+**Out of scope:**
+- Friendly-name mapping (e.g. `QueryAllFiles` → "Query All Files") — consistent with §2.72 Decision 4(a), not revisited here.
+- Permission Set Group-level display — PermSet Groups don't carry system permissions of their own (only via member PermSets, which already show up individually in the Granting Permission Sets table), so no separate group section, consistent with how `CustomPermissionDetail` also omits groups.
+- Search/filter refinements on the impacted-users count (e.g. drill-down list of the actual users) — the count is a stat, not yet a clickable list. Could be added later if wanted.
+
+---
+
+### 2.98 BUG-25 — SetupEntityDetail's "Impacted active users" stat always reads 0 — OPEN, not implemented
+
+> **Status:** Discovered as a byproduct of building UX-67 (§2.97), not fixed. Flagged for a future patch.
+
+**Finding.** While building `SystemPermissionDetail`'s impacted-user count, I initially copied the guard clause from `SetupEntityDetail`'s existing `impactedUserCount` (used for the Apex Class / Visualforce Page reverse lookup, ~line 3457): `if (!toBool(u.IsActive)) continue;`. `User.csv` (Query 4) is `SELECT Id, Name, Email, Profile.Name, ProfileId, UserRoleId, LastLoginDate FROM User WHERE UserType = 'Standard' AND IsActive = true` — filtered server-side, with no `IsActive` column in the SELECT at all. `toBool(undefined)` is `false`, so the guard skips every single user, and `SetupEntityDetail`'s "Impacted active users" stat has always silently displayed 0 regardless of the true count. Confirmed by running the same logic standalone against the live bundle CSVs: without the dead guard, real impacted-user counts come back non-zero (e.g. 14 for `PermissionsQueryAllFiles` in `SystemPermissionDetail`, which does NOT carry this guard — see §2.97).
+
+**Fix (not applied).** Remove the `if (!toBool(u.IsActive)) continue;` line from `SetupEntityDetail`'s `impactedUserCount` memo — `idx.userById` is already guaranteed active + Standard by Query 4's SOQL, so no additional guard is possible or needed.
+
+**Out of scope for this entry:** Applying the fix. Manoj asked for UX-67 specifically; this is a drive-by finding in an unrelated existing component, left for a separate explicit go-ahead per standing workflow preference.
+
+---
+
 
 ## 3. Technical Architecture
 
@@ -2576,6 +2622,7 @@ This screen is the 5.2 Landing Screen from v1.9 of the spec. In v2.0+ it is repl
 
 | Version | Date | Changes |
 |---|---|---|
+| 2026-08-v3.9.0 | August 18 2026 | **Feature — implemented.** **UX-67** (§2.97). New Explorer entry point "System Permissions" — reverse lookup for any tracked `Permissions*` column (sourced from `idx.allSysCols`, so it covers all 88 DATA-2 §2.95 columns automatically, plus any future `extraCols`). New `SystemPermissionDetail` component modeled on `CustomPermissionDetail`: Granting Permission Sets table, Granting Profiles table (Profile rows keyed directly by Profile.Id in `sysPermsByParent`, no implicit-PermSet fan-out needed), and an "Impacted active users" count (profile + directly-assigned PermSets via `userSources()`, muting excluded since system permissions can't be muted). Both tables use the existing `SubSectionTable` component, which gives per-table search and CSV export for free. Requested directly after §2.95/§2.96 shipped, in response to "how do I see which PermSets have Query All Files" having no in-app answer. No data-pipeline changes — reads data DATA-2 already populated; works against the current bundle with no re-refresh needed. esbuild verified. Header/APP_VERSION/package.json/index.html/README bumped to v3.9.0. **NEEDS in-browser click-through check** (new Explorer entry point, new detail component) — sandbox has no headless browser to verify interactively; logic was cross-checked against the CSV/SOQL-derived counts from §2.95/§2.96 (2 PermSets + 1 Profile for Query All Files) but the actual click path (search → select → tables render → row click navigates) has not been visually confirmed. |
 | 2026-08-v3.8.1 | August 18 2026 | **Bug-fix patch — implemented.** **BUG-24** (§2.96). The automatic weekly refresh after v3.8.0 shipped failed twice with `REFRESH FAILED (3): REST export failed for Profile`. Root cause: 3 of DATA-2's 73 new columns (`PermissionsInstallPackaging`, `PermissionsPublishPackaging`, `PermissionsCreatePackaging`) are valid on `PermissionSet` but don't exist on `Profile` — Salesforce uses legacy names there (`PermissionsInstallMultiforce`/`PermissionsPublishMultiforce`/`PermissionsCreateMultiforce`), confirmed via `SELECT FIELDS(ALL) FROM Profile`. One invalid field name fails the entire SOQL SELECT. Fix: dropped the 3 fields from Query 1 (Profile) only — they remain correct in Query 13 (PermissionSet). Query 1 is now 77 columns (was 80), Query 13 unchanged at 88. Updated in `PermissionExplorer.jsx` `SOQL.profile`, `requirements_v3_0.md` §5.1 Query 1, and `scripts/weekly-refresh.sh` `Profile` dataset line. The prior bundle was never corrupted — weekly-refresh.sh's fail-without-overwrite design worked as intended on both failed attempts. esbuild + `bash -n` verified. Header/APP_VERSION/package.json/index.html bumped to v3.8.1. |
 | 2026-08-v3.8.0 | August 18 2026 | **Data expansion — implemented.** **DATA-2** (§2.95). Manoj asked the app to surface which PermissionSets/Profiles hold "Query All Files"; investigation found `PermissionsQueryAllFiles` wasn't in the enumerated column set at all. `SELECT FIELDS(ALL) FROM PermissionSet LIMIT 1` against the `bullhorn` org (API v67) confirmed 835 total `Permissions*` columns exist, of which the app tracked only 15. Curated a 73-field governance-relevant shortlist across 5 categories (data access/query-scope, user/access administration, identity/session security, privacy/compliance/classification, metadata/packaging/deploy) and added all of them — the ~747 remaining columns are narrow feature-specific toggles (Tableau, Einstein/Agentforce, Slack, CDP, ITSM, etc.) with no governance relevance. Changes in three places kept in sync: `PermissionExplorer.jsx` `SOQL.profile` (7→80 columns), `SOQL.sysPerms` (15→88 columns), and `SYSPERM_COLS` (12→88, now first-class instead of falling through `extraCols` auto-detect); `requirements_v3_0.md` §5.1 Query 1 and Query 13 canonical SOQL; `scripts/weekly-refresh.sh` `Profile` and `SystemPermissions_PermSet` dataset-definition lines. No rendering changes required — the tolerant CSV parser and `tokenToNoun()` already handle unrecognized `Permissions*` columns generically (validated when `PermissionsTransferAny*` shipped in v3.0.1). esbuild verified. Header/`APP_VERSION`/`package.json`/`index.html`/README bumped to v3.8.0. **Not yet done:** re-running `scripts/weekly-refresh.sh` and rebuilding the bundle so the new columns are actually populated with data — deferred per standing instruction not to touch the bundle without explicit go-ahead beyond the code/spec change. |
 | 2026-04-v1.0 | April 2026 | Initial design. Core architecture, full SOQL query reference, multi-directional exploration, change impact, overlap & redundancy, profile-to-PermSet Group migration planning, role hierarchy context, reporting & export. |

@@ -1,11 +1,19 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-08-v3.8.1
+  Version: 2026-08-v3.9.0
   Claude.ai artifact — single file, default export.
 
-  (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, v3.7.1, v3.8.0, and
-  v3.8.1 are tracked in requirements_v3_0.md "Version History" — the canonical
-  changelog.)
+  (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, v3.7.1, v3.8.0, v3.8.1,
+  and v3.9.0 are tracked in requirements_v3_0.md "Version History" — the
+  canonical changelog.)
+
+  v3.9.0 — feature: UX-67 (§2.97). New Explorer entry point "System
+    Permissions" — reverse lookup for any tracked Permissions* column (sourced
+    from idx.allSysCols, so it covers all 88 DATA-2 columns automatically).
+    New SystemPermissionDetail component (modeled on CustomPermissionDetail):
+    Granting Permission Sets table, Granting Profiles table, and an Impacted
+    active users count (profile + assigned PermSets, muting excluded). No data
+    pipeline changes — reads idx.sysPermsByParent, already populated by DATA-2.
 
   v3.8.1 — fix: BUG-24 (§2.96). The automatic weekly refresh after v3.8.0
     shipped failed on the Profile export: 3 of DATA-2's 73 new columns
@@ -569,7 +577,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-08-v3.8.1";
+const APP_VERSION = "2026-08-v3.9.0";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -3550,6 +3558,87 @@ function CustomPermissionDetail({ idx, item, nav }) {
   );
 }
 
+// UX-67 v3.9: reverse lookup for a single System Permission column (e.g.
+// PermissionsQueryAllFiles) — modeled on CustomPermissionDetail, the closest
+// existing analog (both are boolean-flag grants, no CRUD nuance). Reads
+// idx.sysPermsByParent, which already carries BOTH non-implicit PermissionSets
+// (keyed by PermSet.Id) and Profiles (keyed by Profile.Id directly — no
+// implicit-PermSet fan-out needed here, unlike Object/Field reverse lookups).
+function SystemPermissionDetail({ idx, item, nav }) {
+  const key = item.key;
+  const label = key.replace(/^Permissions/, "");
+
+  const grantingPs = useMemo(() => {
+    const out = [];
+    for (const [parentId, row] of idx.sysPermsByParent.entries()) {
+      if (!row.perms || row.perms[key] !== true) continue;
+      const ps = idx.permSetById.get(parentId);
+      if (ps) out.push(ps);
+    }
+    return out.sort((a, b) => (a.Label || a.Name || "").localeCompare(b.Label || b.Name || ""));
+  }, [idx, key]);
+
+  const grantingProfiles = useMemo(() => {
+    const out = [];
+    for (const [parentId, row] of idx.sysPermsByParent.entries()) {
+      if (!row.perms || row.perms[key] !== true) continue;
+      const pr = idx.profileById.get(parentId);
+      if (pr) out.push(pr);
+    }
+    return out.sort((a, b) => (a.Name || "").localeCompare(b.Name || ""));
+  }, [idx, key]);
+
+  // Impacted active users: profile + directly-assigned PermSets (muting excluded —
+  // system permissions cannot be muted in Salesforce). Unlike the Object/Field/
+  // SetupEntity reverse lookups, no profileFanoutIds() fan-out is needed: Profile
+  // rows are keyed directly by Profile.Id in sysPermsByParent (see BUG-15 §2.64).
+  // NOTE: idx.userById is already filtered to active Standard users by Query 4's
+  // SOQL (`WHERE UserType = 'Standard' AND IsActive = true`) — User.csv has no
+  // IsActive column at all, so no extra guard is needed (or possible) here.
+  // (SetupEntityDetail's impactedUserCount, ~line 3457, guards on toBool(u.IsActive)
+  // — always false on this undefined field, so that stat silently always reads 0.
+  // Not fixed here; out of scope for UX-67, flagged separately.)
+  const impactedUserCount = useMemo(() => {
+    let n = 0;
+    for (const u of idx.userById.values()) {
+      const srcs = userSources(idx, u.Id);
+      let hit = false;
+      for (const s of srcs) {
+        if (s.kind === "muting") continue;
+        const row = idx.sysPermsByParent.get(s.id);
+        if (row && row.perms && row.perms[key] === true) { hit = true; break; }
+      }
+      if (hit) n++;
+    }
+    return n;
+  }, [idx, key]);
+
+  return (
+    <div className="pe-fade">
+      <Breadcrumb nav={nav} items={[{ label: "System Permissions" }, { label }]} />
+      <HeaderBlock title={label} subtitle="System permission reverse lookup"
+        tags={[<Pill key="t" tone="red">System Permission</Pill>]} />
+
+      <StatsRow stats={[
+        { label: "Permission Sets granting", value: grantingPs.length, tone: "accent" },
+        { label: "Profiles granting", value: grantingProfiles.length, tone: "purple" },
+        { label: "Impacted active users", value: impactedUserCount, tone: impactedUserCount > 0 ? "cyan" : "muted" },
+      ]} />
+
+      <SubSectionTable title="Granting Permission Sets" rows={grantingPs.map(r => ({ ...r, permSetId: r.Id }))} columns={[
+        { key: "Label", label: "Label", render: r => <span onClick={() => nav({ kind: "PermissionSet", item: r })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Label}</span> },
+        { key: "Name", label: "API Name" },
+        { key: "Type", label: "Type", render: r => <Pill tone={r.Type === "Muting" ? "orange" : "muted"}>{r.Type || "Regular"}</Pill> },
+      ]} getRowId={r => r.Id} emptyText={`No Permission Sets grant ${label}.`} />
+
+      <SubSectionTable title="Granting Profiles" rows={grantingProfiles.map(r => ({ ...r, profileId: r.Id }))} columns={[
+        { key: "Name", label: "Profile", render: r => <span onClick={() => nav({ kind: "Profile", item: r })} style={{ color: T.accentLight, cursor: "pointer" }}>{r.Name}</span> },
+        { key: "UserType", label: "UserType" },
+      ]} getRowId={r => r.Id} emptyText={`No Profiles grant ${label}.`} />
+    </div>
+  );
+}
+
 // ---- Explorer sidebar + shell -----------------------------------------------
 // v2.6 UX-19: three new entry points — Apex Class, Visualforce Page, Custom Permission —
 // each sourced from SetupEntityAccess and cross-referenced with CustomPermission.
@@ -3564,6 +3653,9 @@ const ENTRY_POINTS = [
   { key: "ApexClass",     label: "Apex Classes",   icon: "{ }", tone: "green" },
   { key: "VfPage",        label: "Visualforce Pages", icon: "◨", tone: "yellow" },
   { key: "CustomPermission", label: "Custom Permissions", icon: "✦", tone: "orange" },
+  // UX-67 v3.9: reverse lookup for tracked system permissions (SYSPERM_COLS +
+  // any extraCols picked up from a CSV — see idx.allSysCols, populated by DATA-2 §2.95).
+  { key: "SystemPermission", label: "System Permissions", icon: "⚑", tone: "red" },
 ];
 
 // v3.4: lightweight fixed-height windowed list. Owns its scroll container and
@@ -3732,6 +3824,12 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
       }
       return [...map.values()].sort((a, b) => (a.MasterLabel || a.DeveloperName).localeCompare(b.MasterLabel || b.DeveloperName));
     }
+    // UX-67 v3.9: every tracked Permissions* column — sourced from idx.allSysCols so
+    // it automatically includes SYSPERM_COLS (88 as of DATA-2) plus any extraCols a
+    // CSV introduces later, with no code change needed.
+    if (entry === "SystemPermission") {
+      return [...(idx.allSysCols || [])].sort().map(k => ({ key: k }));
+    }
     return [];
   }, [idx, entry]);
 
@@ -3746,6 +3844,7 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
       entry === "Field" ? it.Field :
       entry === "ApexClass" || entry === "VfPage" ? it.SetupEntityId :
       entry === "CustomPermission" ? `${it.MasterLabel || ""} ${it.DeveloperName || ""}` :
+      entry === "SystemPermission" ? it.key.replace(/^Permissions/, "") :
       "";
     return s && s.toLowerCase().includes(qLow);
   }), [listData, qLow, entry]);
@@ -3764,9 +3863,11 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
       return <div style={{ fontFamily: T.mono, fontSize: 12 }}>{it.SetupEntityId}</div>;
     if (entry === "CustomPermission")
       return <><div>{it.MasterLabel || it.DeveloperName}</div><div style={{ fontSize: 11, color: T.textMuted, fontFamily: T.mono }}>{it.DeveloperName}</div></>;
+    if (entry === "SystemPermission")
+      return <div style={{ fontFamily: T.mono }}>{it.key.replace(/^Permissions/, "")}</div>;
     return <div>?</div>;
   };
-  const itemKey = it => it.Id || it.SobjectType || it.Field || it.SetupEntityId || it.DeveloperName;
+  const itemKey = it => it.Id || it.SobjectType || it.Field || it.SetupEntityId || it.DeveloperName || it.key;
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "300px 1fr", height: "calc(100vh - 70px)" }}>
@@ -3816,6 +3917,7 @@ function ExplorerTab({ idx, selection, setSelection, isSimulating, onSimulationM
           selection.kind === "ApexClass" ? <SetupEntityDetail idx={idx} item={selection.item} nav={setSelection} kind="ApexClass" /> :
           selection.kind === "VfPage" ? <SetupEntityDetail idx={idx} item={selection.item} nav={setSelection} kind="ApexPage" /> :
           selection.kind === "CustomPermission" ? <CustomPermissionDetail idx={idx} item={selection.item} nav={setSelection} /> :
+          selection.kind === "SystemPermission" ? <SystemPermissionDetail idx={idx} item={selection.item} nav={setSelection} /> :
           <Empty text="Unknown selection type." />
         )}
       </div>
