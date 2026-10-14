@@ -1982,6 +1982,34 @@ No rendering changes are required: the CSV parser already auto-detects any `Perm
 
 ---
 
+### 2.99 UX-68 — PermSet ↔ PermSet Group membership with names and Ids — IMPLEMENTED in v3.10.0
+
+> **Status:** Requested by Manoj: "what permission set groups a permission set is associated with, and vice versa — all perm sets in a group; both NAMES and IDS." Scope explicitly limited to the two existing detail views (no standalone cross-reference table).
+
+**Problem.** Group → members existed (`GroupDetail` "Member PermSets") but showed only label and role — no Id or API name. PermSet → groups had no UI at all; the reverse map existed only inside the provenance code (`psToGroups`).
+
+**Changes (implemented in v3.10.0):**
+- `buildIndex` — new `idx.groupsByPermSet` (PermSetId → `[{ GroupId }]`), built from `PermissionSetGroupComponent` next to `groupMembers`. Rebuilt automatically after simulation mutations, which already rewrite `PermissionSetGroupComponent`.
+- `PermSetDetail` — new "Member of PermSet Groups" `SubSectionTable`: Group (clickable → group detail), Group API Name (`DeveloperName`), Group Id, Role in Group (Additive/Muting, from the PermSet's `Type`). Empty text: "Not a member of any PermSet Group."
+- `GroupDetail` — header shows the group Id and API Name as pills; Member PermSets table gains PermSet API Name (`PermissionSet.Name`) and PermSet Id columns alongside the existing Label and Role.
+- Ids and API names are visible columns, so the existing per-table CSV export (`SubSectionTable`) includes them with no extra work.
+- No new SOQL, no data-pipeline change, no bundle rebuild — all fields already exist in `PermissionSetGroupComponent.csv`, `PermissionSetGroup.csv` (Query 3: Id, DeveloperName, MasterLabel, Description) and `PermissionSet.csv`.
+- esbuild verified. Header/`APP_VERSION`/package.json/index.html/README bumped to v3.10.0.
+
+**Acceptance criteria:**
+- Explorer → Permission Sets → select a PermSet that belongs to a group → "Member of PermSet Groups" lists each group with label, API name and 0Pg… Id; clicking a row opens that group.
+- A PermSet in no group shows the empty-state text.
+- Explorer → PermSet Groups → select a group → header shows Id/API pills; Member PermSets lists label, API name, 0PS… Id and role for every member.
+- Export CSV on either table contains the Id and API Name columns.
+
+**Out of scope:**
+- A standalone flat "PermSet ↔ Group membership" table / single CSV (one row per pair). Can be added later as a new Explorer entry point or Admin export.
+- Showing group membership for Profile-owned (implicit) PermSets — they cannot belong to groups.
+
+**NEEDS in-browser click-through check** — no headless browser in the build sandbox.
+
+---
+
 
 ## 3. Technical Architecture
 
@@ -2622,6 +2650,7 @@ This screen is the 5.2 Landing Screen from v1.9 of the spec. In v2.0+ it is repl
 
 | Version | Date | Changes |
 |---|---|---|
+| 2026-10-v3.10.0 | October 14 2026 | **Feature — implemented.** **UX-68** (§2.99). PermSet ↔ PermSet Group membership with names and Ids: new "Member of PermSet Groups" table on PermSet detail (Group label/API name/Id, role), and Member PermSets table + header on Group detail now show PermSet API name/Id and group Id/API name. New `idx.groupsByPermSet` reverse map. Scope limited to the two detail views per request. No data-pipeline changes. esbuild verified. **NEEDS in-browser click-through check.** |
 | 2026-08-v3.9.0 | August 18 2026 | **Feature — implemented.** **UX-67** (§2.97). New Explorer entry point "System Permissions" — reverse lookup for any tracked `Permissions*` column (sourced from `idx.allSysCols`, so it covers all 88 DATA-2 §2.95 columns automatically, plus any future `extraCols`). New `SystemPermissionDetail` component modeled on `CustomPermissionDetail`: Granting Permission Sets table, Granting Profiles table (Profile rows keyed directly by Profile.Id in `sysPermsByParent`, no implicit-PermSet fan-out needed), and an "Impacted active users" count (profile + directly-assigned PermSets via `userSources()`, muting excluded since system permissions can't be muted). Both tables use the existing `SubSectionTable` component, which gives per-table search and CSV export for free. Requested directly after §2.95/§2.96 shipped, in response to "how do I see which PermSets have Query All Files" having no in-app answer. No data-pipeline changes — reads data DATA-2 already populated; works against the current bundle with no re-refresh needed. esbuild verified. Header/APP_VERSION/package.json/index.html/README bumped to v3.9.0. **NEEDS in-browser click-through check** (new Explorer entry point, new detail component) — sandbox has no headless browser to verify interactively; logic was cross-checked against the CSV/SOQL-derived counts from §2.95/§2.96 (2 PermSets + 1 Profile for Query All Files) but the actual click path (search → select → tables render → row click navigates) has not been visually confirmed. |
 | 2026-08-v3.8.1 | August 18 2026 | **Bug-fix patch — implemented.** **BUG-24** (§2.96). The automatic weekly refresh after v3.8.0 shipped failed twice with `REFRESH FAILED (3): REST export failed for Profile`. Root cause: 3 of DATA-2's 73 new columns (`PermissionsInstallPackaging`, `PermissionsPublishPackaging`, `PermissionsCreatePackaging`) are valid on `PermissionSet` but don't exist on `Profile` — Salesforce uses legacy names there (`PermissionsInstallMultiforce`/`PermissionsPublishMultiforce`/`PermissionsCreateMultiforce`), confirmed via `SELECT FIELDS(ALL) FROM Profile`. One invalid field name fails the entire SOQL SELECT. Fix: dropped the 3 fields from Query 1 (Profile) only — they remain correct in Query 13 (PermissionSet). Query 1 is now 77 columns (was 80), Query 13 unchanged at 88. Updated in `PermissionExplorer.jsx` `SOQL.profile`, `requirements_v3_0.md` §5.1 Query 1, and `scripts/weekly-refresh.sh` `Profile` dataset line. The prior bundle was never corrupted — weekly-refresh.sh's fail-without-overwrite design worked as intended on both failed attempts. esbuild + `bash -n` verified. Header/APP_VERSION/package.json/index.html bumped to v3.8.1. |
 | 2026-08-v3.8.0 | August 18 2026 | **Data expansion — implemented.** **DATA-2** (§2.95). Manoj asked the app to surface which PermissionSets/Profiles hold "Query All Files"; investigation found `PermissionsQueryAllFiles` wasn't in the enumerated column set at all. `SELECT FIELDS(ALL) FROM PermissionSet LIMIT 1` against the `bullhorn` org (API v67) confirmed 835 total `Permissions*` columns exist, of which the app tracked only 15. Curated a 73-field governance-relevant shortlist across 5 categories (data access/query-scope, user/access administration, identity/session security, privacy/compliance/classification, metadata/packaging/deploy) and added all of them — the ~747 remaining columns are narrow feature-specific toggles (Tableau, Einstein/Agentforce, Slack, CDP, ITSM, etc.) with no governance relevance. Changes in three places kept in sync: `PermissionExplorer.jsx` `SOQL.profile` (7→80 columns), `SOQL.sysPerms` (15→88 columns), and `SYSPERM_COLS` (12→88, now first-class instead of falling through `extraCols` auto-detect); `requirements_v3_0.md` §5.1 Query 1 and Query 13 canonical SOQL; `scripts/weekly-refresh.sh` `Profile` and `SystemPermissions_PermSet` dataset-definition lines. No rendering changes required — the tolerant CSV parser and `tokenToNoun()` already handle unrecognized `Permissions*` columns generically (validated when `PermissionsTransferAny*` shipped in v3.0.1). esbuild verified. Header/`APP_VERSION`/`package.json`/`index.html`/README bumped to v3.8.0. **Not yet done:** re-running `scripts/weekly-refresh.sh` and rebuilding the bundle so the new columns are actually populated with data — deferred per standing instruction not to touch the bundle without explicit go-ahead beyond the code/spec change. |
