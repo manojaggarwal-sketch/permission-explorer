@@ -1,6 +1,6 @@
 /*
   Salesforce Permission Explorer
-  Version: 2026-10-v3.10.0
+  Version: 2026-10-v3.10.1
   Claude.ai artifact — single file, default export.
 
   (In-file changelog below ends at v3.6; v3.6.1, v3.7.0, v3.7.1, v3.8.0, v3.8.1,
@@ -952,7 +952,7 @@ function datasetsHaveData(d) {
 // v3.3: single source of truth for the app version. Stamped into every exported
 // pebundle's `appVersion` field. Keep in sync with the header comment,
 // package.json, and index.html on each release.
-const APP_VERSION = "2026-10-v3.10.0";
+const APP_VERSION = "2026-10-v3.10.1";
 
 // v3.5: spread onto free-text inputs to stop browser/OS credential autofill
 // (Safari/iCloud Passwords "Enable Password AutoFill" key popup, 1Password,
@@ -3893,8 +3893,9 @@ function SetupEntityDetail({ idx, item, nav, kind }) {
   // Count impacted users = active users whose effective access includes this setup entity.
   const impactedUserCount = useMemo(() => {
     let n = 0;
+    // idx.userById is already active Standard users only (Query 4 SOQL filter;
+    // User.csv has no IsActive column) — BUG-25: no extra guard.
     for (const u of idx.userById.values()) {
-      if (!toBool(u.IsActive)) continue;
       const srcs = userSources(idx, u.Id);
       let hit = false;
       for (const s of srcs) {
@@ -4026,9 +4027,7 @@ function SystemPermissionDetail({ idx, item, nav }) {
   // NOTE: idx.userById is already filtered to active Standard users by Query 4's
   // SOQL (`WHERE UserType = 'Standard' AND IsActive = true`) — User.csv has no
   // IsActive column at all, so no extra guard is needed (or possible) here.
-  // (SetupEntityDetail's impactedUserCount, ~line 3457, guards on toBool(u.IsActive)
-  // — always false on this undefined field, so that stat silently always reads 0.
-  // Not fixed here; out of scope for UX-67, flagged separately.)
+  // (SetupEntityDetail's former dead IsActive guard was removed in v3.10.1 / BUG-25.)
   const impactedUserCount = useMemo(() => {
     let n = 0;
     for (const u of idx.userById.values()) {

@@ -185,6 +185,16 @@ printf '{"ts":"%s","source":"%s","Profile":%s,"PermissionSet":%s,"PermissionSetG
   "$(rows PermissionSetAssignment)" "$(rows ObjectPermissions)" "$(rows SetupEntityAccess)" "$(rows FieldPermissions)" \
   >> "$HISTORY"
 
+# ---------- 9. Build Claude/SQL query layer (pe.duckdb, MANIFEST.json, changes_latest.*) ----------
+# NON-FATAL: a failure here must never fail the refresh. Needs `pip3 install duckdb` on the Mac.
+PYDB=$PY; [ -x /opt/homebrew/bin/python3 ] && PYDB=/opt/homebrew/bin/python3
+if "$PYDB" -c 'import duckdb' 2>/dev/null; then
+  "$PYDB" "$ROOT/scripts/build-pe-db.py" --bundles "$BUNDLES" --app-version "$APP_VERSION" --source "$BUNDLE_SRC" \
+    || echo "[WARN] build-pe-db.py failed — pe.duckdb not updated (refresh itself is OK)"
+else
+  echo "[WARN] duckdb python module missing ($PYDB) — run: $PYDB -m pip install duckdb ; skipping pe.duckdb build"
+fi
+
 rm -rf "$STAGE"
 rm -f "$BUNDLES/LAST_RUN_ERROR.txt"
 SIZE=$(ls -lh "$BUNDLES"/*.pebundle | head -1 | awk '{print $5}')

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <meta name="author" content="Permission Explorer — root cause &amp; fix" />
+  <meta name="dcterms.date" content="2026-06-15" />
+  <title>BUG-23 — Objects with field-level security but no object-level permission are dropped from object views</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+  </style>
+  <style>
+  @page { size: 17in 11in; margin: 0.6in 0.7in; }
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; color: #1a1a1a; }
+  h1 { font-size: 20pt; margin: 0 0 6pt; }
+  h2 { font-size: 14pt; margin: 16pt 0 4pt; page-break-after: avoid; border-bottom: 1px solid #ccc; padding-bottom: 2pt; }
+  h3 { font-size: 11.5pt; margin: 10pt 0 3pt; page-break-after: avoid; }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt; background: #f3f3f3; padding: 1px 3px; border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; font-size: 9.5pt; margin: 8pt 0; table-layout: auto; page-break-inside: avoid; }
+  table colgroup, table col { width: auto !important; }
+  th, td { border: 1px solid #bbb; padding: 4px 7px; text-align: left; vertical-align: top; }
+  th { background: #ececec; font-weight: 600; }
+  tr:nth-child(even) td { background: #fafafa; }
+  p { margin: 4pt 0 6pt; }
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">BUG-23 — Objects with field-level security but no object-level permission are dropped from object views</h1>
+<p class="author">Permission Explorer — root cause &amp; fix</p>
+<p class="date">2026-06-15</p>
+</header>
+<h1 id="bug-23-fls-only-objects-are-missing-from-object-centric-views">BUG-23 — FLS-only objects are missing from object-centric views</h1>
+<h2 id="summary">Summary</h2>
+<p>Permission Explorer builds every object-centric view from <code>ObjectPermissions</code> alone. When a grantor has <code>FieldPermissions</code> (field-level security) on an object but <strong>no</strong> <code>ObjectPermissions</code> row for that object, the object is silently dropped: it never appears in the grantor’s Objects list, it is not counted, and it does not appear as a grantor in the object reverse-lookup. The field grants themselves still render in the Fields sections, so the data is loaded — it is only the <em>object</em> dimension that loses it.</p>
+<p>This was reported against the <strong>Bullhorn Community Profile</strong> (a Guest profile): <code>OrderItem</code> has field grants but shows “No object permissions for this grantor” and cannot be found in the profile’s Objects list. The pattern is general, not specific to OrderItem or to this profile.</p>
+<h2 id="reproduction-and-confirming-data">Reproduction and confirming data</h2>
+<p>The Bullhorn Community Profile’s permissions hang off its implicit, profile-owned PermissionSet <code>0PS0P000000b5cDWAQ</code>. A live query confirms three field grants on <code>OrderItem</code> and zero object grants:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Grantor (implicit PS)</th>
+<th>Object</th>
+<th>Field</th>
+<th>Read</th>
+<th>Edit</th>
+<th>ObjectPermissions row?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0PS0P000000b5cDWAQ</td>
+<td>OrderItem</td>
+<td>OrderItem.Description</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+<tr class="even">
+<td>0PS0P000000b5cDWAQ</td>
+<td>OrderItem</td>
+<td>OrderItem.ListPrice</td>
+<td>Yes</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr class="odd">
+<td>0PS0P000000b5cDWAQ</td>
+<td>OrderItem</td>
+<td>OrderItem.ProductCode</td>
+<td>Yes</td>
+<td>No</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p><code>SELECT … FROM ObjectPermissions WHERE SobjectType = 'OrderItem' AND ParentId = '0PS0P000000b5cDWAQ'</code> returns zero rows, while the matching <code>FieldPermissions</code> query returns the three rows above. This is a normal Salesforce state: field-level security can be set on an object whose object-level CRUD is not granted in the same parent (object access may come from elsewhere, or FLS was configured without CRUD).</p>
+<h2 id="root-cause">Root cause</h2>
+<p>Three code paths derive objects exclusively from the <code>ObjectPermissions</code>-backed index <code>objPermsByParent</code> / <code>objPermsBySobj</code>, and never consult <code>fieldPermsByParent</code> / <code>fieldPermsBySobj</code>:</p>
+<p>The grantor detail (Profile and PermSet) Objects table, in <code>ParentDetailSubSections</code>, set <code>objRows</code> from <code>objPermsByParent</code> only. The per-user effective object map, <code>effectiveObjects()</code>, iterated only <code>objPermsByParent</code>, so a user with FLS-only access to an object never saw that object in their effective view. The object reverse-lookup, <code>ObjectDetail</code>, built its Grantors table and “Grantors” count from <code>objPermsBySobj</code> only, so a profile that grants an object purely through FLS was absent from that object’s grantor list.</p>
+<p>Because the field grants do flow through the separate field index, the Fields sections and the “Fields granted” counts remained correct throughout — which is why the loss is easy to miss and presents as a confusing “the object isn’t there, but its fields are.”</p>
+<h2 id="scope">Scope</h2>
+<p>This is widespread. Org-wide, <code>FieldPermissions</code> reference <strong>746 distinct objects</strong> while <code>ObjectPermissions</code> reference <strong>1,179</strong>; any grantor holding FLS on an object without a co-located object-permission row triggers the gap. OrderItem on the Guest profile is one visible instance among many, spanning both profiles and permission sets.</p>
+<h2 id="fix">Fix</h2>
+<p>The fix introduces a single shared notion of a <strong>field-only object</strong> — an object a grantor reaches through FLS with no object-level CRUD row — surfaced consistently across all three views, flagged with an <code>FLS-only</code> pill so admins can tell it apart from a true object grant.</p>
+<p>A new helper, <code>fieldOnlyObjectRows(objPermRows, fieldRows)</code>, takes a grantor’s already-collected object-permission rows and field-permission rows and returns synthetic object rows (CRUD all false, <code>fieldOnly: true</code>, with a <code>fieldGrantCount</code>) for the SObjectTypes that appear only in field permissions. <code>ParentDetailSubSections</code> now appends these to <code>objRows</code>, so the Objects table for any Profile or PermSet includes FLS-only objects, badged <code>FLS-only (n)</code>. <code>effectiveObjects()</code> now performs an equivalent pass over each non-muting source’s field permissions, adding any object not already present as a <code>fieldOnly</code> entry with all-false CRUD; the user detail view’s “Effective objects” list and count therefore include them, and they obey the existing “hide zero-grant objects” toggle. <code>ObjectDetail</code> now unions FLS-only grantors into its Grantors table and “Grantors” count, badging them the same way.</p>
+<p>The change is display-completing rather than semantics-changing. The “Objects granted” / “Fields granted” stat cards on the Profile and PermSet headers still count true object-level and field-level grants respectively, so “granted” keeps its object-level meaning; FLS-only objects are additive in the tables and clearly labeled. Critically, <code>userEffectiveSignature</code> only emits object (<code>O:</code>) tokens for truthy CRUD flags, so the synthetic all-false rows added to <code>effectiveObjects()</code> produce no spurious entries in Compare Users or Change Impact diffs.</p>
+<h2 id="validation">Validation</h2>
+<p>The edited <code>PermissionExplorer.jsx</code> bundles cleanly with esbuild (jsx loader, react marked external) with zero errors or warnings. The SOQL evidence above confirms the OrderItem case the fix targets. After the fix, opening the Bullhorn Community Profile lists <code>OrderItem</code> in its Objects table with an <code>FLS-only (3)</code> badge and dashes across CRUD; opening <code>OrderItem</code> lists the Bullhorn Community Profile among its grantors with the same badge.</p>
+<h2 id="notes-for-release">Notes for release</h2>
+<p>This is drafted as <strong>BUG-23</strong> against the current <code>v3.7.0</code> and is suggested for a <code>v3.7.1</code> patch. The code comments, the changelog/version-history block at the top of <code>PermissionExplorer.jsx</code>, the <code>package.json</code> version, and any requirements-spec section are intentionally left for a release pass; only the functional code has been changed so the diff stays easy to review.</p>
+</body>
+</html>

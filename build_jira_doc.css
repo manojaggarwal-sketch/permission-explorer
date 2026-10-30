@@ -1,0 +1,12 @@
+@page { size: 17in 11in; margin: 0.6in 0.7in; }
+body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; color: #1a1a1a; }
+h1 { font-size: 20pt; margin: 0 0 6pt; }
+h2 { font-size: 14pt; margin: 16pt 0 4pt; page-break-after: avoid; border-bottom: 1px solid #ccc; padding-bottom: 2pt; }
+h3 { font-size: 11.5pt; margin: 10pt 0 3pt; page-break-after: avoid; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt; background: #f3f3f3; padding: 1px 3px; border-radius: 3px; }
+table { border-collapse: collapse; width: 100%; font-size: 9.5pt; margin: 8pt 0; table-layout: auto; page-break-inside: avoid; }
+table colgroup, table col { width: auto !important; }
+th, td { border: 1px solid #bbb; padding: 4px 7px; text-align: left; vertical-align: top; }
+th { background: #ececec; font-weight: 600; }
+tr:nth-child(even) td { background: #fafafa; }
+p { margin: 4pt 0 6pt; }

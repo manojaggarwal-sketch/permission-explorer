@@ -20,3 +20,7 @@ build/
 
 # Commit-message scratch files
 .git-commit-msg-*.txt
+
+# One-off patch script / artifact scratch
+scripts/patch_refresh4.py
+pe_trends_updated.html
