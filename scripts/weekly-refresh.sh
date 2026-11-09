@@ -1,6 +1,6 @@
 #!/bin/bash
 # weekly-refresh.sh
-# Full Permission Explorer data refresh: 13 Salesforce exports -> staging -> build-pebundle.js
+# Full Permission Explorer data refresh: 18 Salesforce exports -> staging -> build-pebundle.js
 # Runs entirely on this Mac via the sf CLI. ALL exports use REST auto-paging (sf data query
 # -r csv) — never Bulk API 2.0; see note at the dataset definitions for why.
 # Invoked by the Cowork scheduled task; the task only reads the tail of the log afterward.
@@ -71,28 +71,63 @@ echo "[OK] app-version=$APP_VERSION"
 # objects (ObjectPermissions 19,736 of 33,729; FieldPermissions 312,615 of 324,153) with
 # JobComplete status — same quirk class as the PermissionSetTabSetting shortfall.
 # REST auto-paging (sf data query -r csv) returns the complete set (33,729 verified).
-# DATA-2 v3.8 (requirements_v3_0.md §2.95): Profile and SystemPermissions_PermSet SELECTs
-# expanded from 7/15 to 80/88 Permissions* columns — added PermissionsQueryAllFiles plus 72
-# other governance-relevant system permissions. Kept in sync with PermissionExplorer.jsx
-# SOQL.profile / SOQL.sysPerms and requirements_v3_0.md §5.1 Query 1 / Query 13.
+# DATA-3 v3.10 (requirements_v3_0.md §2.99): Profile and SystemPermissions_PermSet carry EVERY
+# Permissions* boolean, exported in 3 chunks each (Profile, Profile_2, Profile_3;
+# SystemPermissions_PermSet, _2, _3) to stay under the REST URL length limit. The app merges
+# chunks by Id (mergeChunksById) and auto-loads any column it doesn't hardcode.
+# The column lists are built at run time from the org's own describe (Profile and PermissionSet
+# do NOT share an identical field set), so they can never drift: a hardcoded list broke the
+# 2026-11-09 run (PermissionsCustomAppsOnFSMobile / PermissionsRegrelloUser don't exist on
+# Profile) and silently omitted 113 newer permissions (CreateTask, AddToCampaign, ConvertProspect...).
+GEN_LINES=$("$PY" - "$ORG" <<'PYEOF'
+import json, subprocess, sys
+org = sys.argv[1]
+MAXLEN = 14000   # REST GET URL limit is ~16KB once URL-encoded
+def perm_fields(sobj):
+    r = subprocess.run(["sf", "sobject", "describe", "-s", sobj, "-o", org, "--json"],
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        sys.stderr.write(f"describe {sobj} failed: {r.stderr[:300]} {r.stdout[:300]}\n"); sys.exit(1)
+    fs = json.loads(r.stdout)["result"]["fields"]
+    names = sorted(f["name"] for f in fs if f["name"].startswith("Permissions") and f["type"] == "boolean")
+    if len(names) < 500:
+        sys.stderr.write(f"describe {sobj}: only {len(names)} Permissions* fields — refusing\n"); sys.exit(1)
+    return names
+def emit(prefix, sobj, head, where):
+    names = perm_fields(sobj)
+    n = len(names); size = -(-n // 3)
+    chunks = [names[i*size:(i+1)*size] for i in range(3)]
+    for i, ch in enumerate(chunks):
+        cols = (head if i == 0 else "Id") + ", " + ", ".join(ch)
+        q = f"SELECT {cols} FROM {sobj}" + (f" WHERE {where}" if where else "")
+        if len(q) > MAXLEN:
+            sys.stderr.write(f"{prefix} chunk {i+1} query is {len(q)} chars (> {MAXLEN})\n"); sys.exit(1)
+        key = prefix + ("" if i == 0 else f"_{i+1}")
+        print(f"{key}|rest|{q}")
+    sys.stderr.write(f"[GEN] {prefix}: {n} Permissions* fields in 3 chunks\n")
+emit("Profile", "Profile", "Id, Name, UserType, Description, UserLicense.Name, LastModifiedDate", None)
+emit("SystemPermissions_PermSet", "PermissionSet", "Id, Name, Label", "IsOwnedByProfile = false")
+PYEOF
+) || fail 3 "could not build Permissions* chunk queries from org describe"
+
 read -r -d '' DATASETS <<'EOF'
-Profile|rest|SELECT Id, Name, UserType, Description, PermissionsModifyAllData, PermissionsViewAllData, PermissionsApiEnabled, PermissionsAuthorApex, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, PermissionsQueryAllFiles, PermissionsQueryNonVetoedFiles, PermissionsDeleteSalesforceFiles, PermissionsDownloadMaliciousFiles, PermissionsManageMaliciousFiles, PermissionsCanQueryForeignTables, PermissionsRecordVisibilityAPI, PermissionsViewAllForeignKeyNames, PermissionsViewAllCustomSettings, PermissionsViewAllFieldsGlobal, PermissionsManageFilesAndAttachments, PermissionsSelectFilesFromSalesforce, PermissionsViewContent, PermissionsManageInternalUsers, PermissionsManageProfilesPermissionsets, PermissionsAssignPermissionSets, PermissionsResetPasswords, PermissionsFreezeUsers, PermissionsManageSharing, PermissionsManageIpAddresses, PermissionsManagePasswordPolicies, PermissionsManageLoginAccessPolicies, PermissionsPasswordNeverExpires, PermissionsViewAllUsers, PermissionsViewAllProfiles, PermissionsManageUnlistedGroups, PermissionsManageSessionPermissionSets, PermissionsDelegatedPortalUserAdmin, PermissionsApiUserOnly, PermissionsManageTwoFactor, PermissionsForceTwoFactor, PermissionsDelegatedTwoFactor, PermissionsTwoFactorApi, PermissionsSkipIdentityConfirmation, PermissionsIdentityEnabled, PermissionsIdentityConnect, PermissionsManageAuthProviders, PermissionsManageRemoteAccess, PermissionsAllowLightningLogin, PermissionsMonitorLoginHistory, PermissionsManageNetworks, PermissionsViewEventLogFiles, PermissionsUseAnyApiAuth, PermissionsClientSecretRotation, PermissionsViewClientSecret, PermissionsViewUserPII, PermissionsPrivacyDataAccess, PermissionsModifyDataClassification, PermissionsConsentApiUpdate, PermissionsManageCustomerDataOptOut, PermissionsManageGlobalPrivacyCenterVO, PermissionsViewAllDataGovTags, PermissionsModifyAllDataGovTags, PermissionsViewAllDataGovPolicies, PermissionsModifyAllDataGovPolicies, PermissionsViewDataGovTab, PermissionsUseCompliantDataSharing, PermissionsModifyMetadata, PermissionsDownloadPackageVersionZips, PermissionsManageSandboxes, PermissionsManageDevSandboxes, PermissionsManageNamedCredentials, PermissionsManageCertificates, PermissionsManageCertificatesExpiration, PermissionsViewSecurityCommandCenter, PermissionsViewHealthCheck, PermissionsManageHealthCheck, PermissionsViewHealthAssessments, PermissionsManageHealthAssessments, PermissionsCanApproveUninstalledApps FROM Profile
-PermissionSet|rest|SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId FROM PermissionSet
+PermissionSet|rest|SELECT Id, Name, Label, Description, IsCustom, Type, IsOwnedByProfile, ProfileId, NamespacePrefix FROM PermissionSet
 PermissionSetGroup|rest|SELECT Id, DeveloperName, MasterLabel, Description FROM PermissionSetGroup
 User|rest|SELECT Id, Name, Email, Profile.Name, ProfileId, UserRoleId, LastLoginDate FROM User WHERE UserType = 'Standard' AND IsActive = true
 UserRole|rest|SELECT Id, Name, DeveloperName, ParentRoleId, PortalType FROM UserRole WHERE PortalType = 'None'
 PermissionSetGroupComponent|rest|SELECT Id, PermissionSetId, PermissionSet.Name, PermissionSetGroupId, PermissionSetGroup.MasterLabel FROM PermissionSetGroupComponent
 PermissionSetTabSetting|rest|SELECT Id, Name, Visibility, ParentId, Parent.Name FROM PermissionSetTabSetting
 CustomPermission|rest|SELECT Id, DeveloperName, MasterLabel FROM CustomPermission
-SystemPermissions_PermSet|rest|SELECT Id, Name, Label, PermissionsModifyAllData, PermissionsViewAllData, PermissionsManageUsers, PermissionsAuthorApex, PermissionsCustomizeApplication, PermissionsManageCustomPermissions, PermissionsApiEnabled, PermissionsBulkApiHardDelete, PermissionsDataExport, PermissionsViewSetup, PermissionsManageRoles, PermissionsRunReports, PermissionsTransferAnyEntity, PermissionsTransferAnyLead, PermissionsTransferAnyCase, PermissionsQueryAllFiles, PermissionsQueryNonVetoedFiles, PermissionsDeleteSalesforceFiles, PermissionsDownloadMaliciousFiles, PermissionsManageMaliciousFiles, PermissionsCanQueryForeignTables, PermissionsRecordVisibilityAPI, PermissionsViewAllForeignKeyNames, PermissionsViewAllCustomSettings, PermissionsViewAllFieldsGlobal, PermissionsManageFilesAndAttachments, PermissionsSelectFilesFromSalesforce, PermissionsViewContent, PermissionsManageInternalUsers, PermissionsManageProfilesPermissionsets, PermissionsAssignPermissionSets, PermissionsResetPasswords, PermissionsFreezeUsers, PermissionsManageSharing, PermissionsManageIpAddresses, PermissionsManagePasswordPolicies, PermissionsManageLoginAccessPolicies, PermissionsPasswordNeverExpires, PermissionsViewAllUsers, PermissionsViewAllProfiles, PermissionsManageUnlistedGroups, PermissionsManageSessionPermissionSets, PermissionsDelegatedPortalUserAdmin, PermissionsApiUserOnly, PermissionsManageTwoFactor, PermissionsForceTwoFactor, PermissionsDelegatedTwoFactor, PermissionsTwoFactorApi, PermissionsSkipIdentityConfirmation, PermissionsIdentityEnabled, PermissionsIdentityConnect, PermissionsManageAuthProviders, PermissionsManageRemoteAccess, PermissionsAllowLightningLogin, PermissionsMonitorLoginHistory, PermissionsManageNetworks, PermissionsViewEventLogFiles, PermissionsUseAnyApiAuth, PermissionsClientSecretRotation, PermissionsViewClientSecret, PermissionsViewUserPII, PermissionsPrivacyDataAccess, PermissionsModifyDataClassification, PermissionsConsentApiUpdate, PermissionsManageCustomerDataOptOut, PermissionsManageGlobalPrivacyCenterVO, PermissionsViewAllDataGovTags, PermissionsModifyAllDataGovTags, PermissionsViewAllDataGovPolicies, PermissionsModifyAllDataGovPolicies, PermissionsViewDataGovTab, PermissionsUseCompliantDataSharing, PermissionsModifyMetadata, PermissionsInstallPackaging, PermissionsPublishPackaging, PermissionsCreatePackaging, PermissionsDownloadPackageVersionZips, PermissionsManageSandboxes, PermissionsManageDevSandboxes, PermissionsManageNamedCredentials, PermissionsManageCertificates, PermissionsManageCertificatesExpiration, PermissionsViewSecurityCommandCenter, PermissionsViewHealthCheck, PermissionsManageHealthCheck, PermissionsViewHealthAssessments, PermissionsManageHealthAssessments, PermissionsCanApproveUninstalledApps FROM PermissionSet WHERE IsOwnedByProfile = false
 PermissionSetAssignment|rest|SELECT Id, PermissionSet.Id, PermissionSet.Name, PermissionSet.Label, PermissionSet.IsOwnedByProfile, PermissionSet.Type, PermissionSetGroupId, AssigneeId FROM PermissionSetAssignment WHERE Assignee.IsActive = true AND Assignee.UserType = 'Standard'
 ObjectPermissions|rest|SELECT Id, SobjectType, PermissionsCreate, PermissionsRead, PermissionsEdit, PermissionsDelete, PermissionsViewAllRecords, PermissionsModifyAllRecords, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM ObjectPermissions
 SetupEntityAccess|rest|SELECT Id, SetupEntityId, SetupEntityType, ParentId, Parent.Name FROM SetupEntityAccess WHERE SetupEntityType IN ('ApexClass','ApexPage','CustomPermission','TabSet')
 FieldPermissions|rest|SELECT Id, Field, SobjectType, PermissionsRead, PermissionsEdit, ParentId, Parent.Name, Parent.IsOwnedByProfile, Parent.ProfileId FROM FieldPermissions
+SetupAuditTrail|rest|SELECT Id, CreatedDate, Action, Display, CreatedById FROM SetupAuditTrail WHERE Action IN ('PermSetAssign','PermSetUnassign','PermSetGroupAssign','PermSetGroupUnassign')
 EOF
+DATASETS="$GEN_LINES"$'\n'"$DATASETS"
 
 count_where() { # extract WHERE clause (if any) from a SOQL string after FROM <obj>
-  echo "$1" | sed -E 's/^SELECT .* FROM /FROM /'
+  echo "$1" | sed -E 's/^SELECT .* FROM /FROM /; s/ ORDER BY .*$//'
 }
 
 
@@ -114,8 +149,8 @@ PYEOF
     sf data export bulk -o "$ORG" -q "$SOQL" --output-file "$CSV" --result-format csv --wait 30 >/dev/null 2>&1 \
       || fail 3 "Bulk export failed for $KEY"
   else
-    sf data query -o "$ORG" -q "$SOQL" --result-format csv > "$CSV" 2>/dev/null \
-      || fail 3 "REST export failed for $KEY"
+    sf data query -o "$ORG" -q "$SOQL" --result-format csv > "$CSV" 2>"$STAGE/$KEY.err" \
+      || fail 3 "REST export failed for $KEY: $(grep -v '^$' "$STAGE/$KEY.err" | tail -3 | tr '\n' ' ' | cut -c1-400)"
   fi
   ROWS=$(( $(wc -l < "$CSV") - 1 )); [ "$ROWS" -lt 0 ] && ROWS=0
   echo "[EXPORT] $KEY mode=$MODE count=$CNT rows=$ROWS"
@@ -144,6 +179,11 @@ for key, cnt in exp.items():
                 print(f"[SANITY] {key}: staged {rows} drifts {drift:.0%} vs prior staged {prior[key]} — FAIL"); ok = False
         continue
     allow = 0
+    # SetupAuditTrail: rolling 6-month event log — still checked against COUNT(), but no week-over-week drift check.
+    if key == "SetupAuditTrail":
+        if cnt - rows > allow or rows > cnt:
+            print(f"[SANITY] {key}: staged {rows} vs COUNT {cnt} (allowance {allow}) — FAIL"); ok = False
+        continue
     if cnt - rows > allow or rows > cnt:
         print(f"[SANITY] {key}: staged {rows} vs COUNT {cnt} (allowance {allow}) — FAIL"); ok = False
     if prior and key in prior and prior[key] > 0:

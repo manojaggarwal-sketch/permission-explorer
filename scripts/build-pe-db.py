@@ -49,6 +49,22 @@ for t in TABLES:
                 f"quote='\"', escape='\"', strict_mode=false, parallel=false)")
 
 
+# DATA-3 v3.10: fold chunk CSVs (Profile_2/_3, SystemPermissions_PermSet_2/_3) into their base
+# table by Id so downstream views see every Permissions* column. Chunks are optional (older bundles).
+CHUNKS = {"Profile": ["Profile_2", "Profile_3"],
+          "SystemPermissions_PermSet": ["SystemPermissions_PermSet_2", "SystemPermissions_PermSet_3"]}
+for base, chunk_names in CHUNKS.items():
+    for ch in chunk_names:
+        p = os.path.join(B, ch + ".csv")
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            continue
+        con.execute(f"CREATE TABLE t_{ch} AS SELECT * FROM read_csv('{p}', header=true, all_varchar=true, "
+                    f"quote='\"', escape='\"', strict_mode=false, parallel=false)")
+        con.execute(f"CREATE OR REPLACE TABLE t_{base} AS SELECT b.*, c.* EXCLUDE (Id) "
+                    f"FROM t_{base} b LEFT JOIN t_{ch} c ON c.Id = b.Id")
+        con.execute(f"DROP TABLE t_{ch}")
+
+
 def b(col):  # CSV 'true'/'false' -> boolean
     return f"(lower(coalesce({col},'')) = 'true')"
 

@@ -45,10 +45,12 @@ const path = require("path");
 const zlib = require("zlib");
 const crypto = require("crypto");
 
-// The 13 datasets, in the same order and with the same keys as FILES[] in
+// The 18 datasets (13 base + 4 DATA-3 chunk files + SetupAuditTrail), in the same order and with the same keys as FILES[] in
 // PermissionExplorer.jsx. The CSV filename mirrors the JSX FILES[].filename.
 const DATASETS = [
   { key: "Profile",                     csv: "Profile.csv" },
+  { key: "Profile_2",                   csv: "Profile_2.csv" },   // DATA-3 v3.10 chunk 2/3
+  { key: "Profile_3",                   csv: "Profile_3.csv" },   // DATA-3 v3.10 chunk 3/3
   { key: "PermissionSet",               csv: "PermissionSet.csv" },
   { key: "PermissionSetGroup",          csv: "PermissionSetGroup.csv" },
   { key: "User",                        csv: "User.csv" },
@@ -61,6 +63,9 @@ const DATASETS = [
   { key: "SetupEntityAccess",           csv: "SetupEntityAccess.csv" },
   { key: "CustomPermission",            csv: "CustomPermission.csv" },
   { key: "SystemPermissions_PermSet",   csv: "SystemPermissions_PermSet.csv" },
+  { key: "SystemPermissions_PermSet_2", csv: "SystemPermissions_PermSet_2.csv" }, // DATA-3 v3.10 chunk 2/3
+  { key: "SystemPermissions_PermSet_3", csv: "SystemPermissions_PermSet_3.csv" }, // DATA-3 v3.10 chunk 3/3
+  { key: "SetupAuditTrail",             csv: "SetupAuditTrail.csv" },             // UX-60 v3.1 Query 14 (optional in app)
 ];
 
 // ---------- arg parsing ----------
@@ -285,7 +290,7 @@ function main() {
 
   ensureDir(outDir);
 
-  // 1. Read staged rows for all 13 datasets.
+  // 1. Read staged rows for all 18 datasets.
   const byKey = {};
   const counts = {};
   const missing = [];
